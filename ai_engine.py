@@ -36,14 +36,35 @@ logger = logging.getLogger(__name__)
 
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
+# Shared httpx client for Claude API
+_claude_client: Optional[httpx.AsyncClient] = None
+
+
+async def _get_claude_client() -> httpx.AsyncClient:
+    """Get or create the shared Claude API client."""
+    global _claude_client
+    if _claude_client is None or _claude_client.is_closed:
+        _claude_client = httpx.AsyncClient(
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            timeout=120.0,
+        )
+    return _claude_client
+
+
+async def close_claude_client():
+    """Close the shared Claude API client."""
+    global _claude_client
+    if _claude_client and not _claude_client.is_closed:
+        await _claude_client.aclose()
+        _claude_client = None
+
 
 async def call_claude(system_prompt: str, user_message: str, max_tokens: int = 4096) -> str:
-    """Call Claude API and return the response text."""
-    headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
+    """Call Claude API with retry and return the response text."""
     payload = {
         "model": CLAUDE_MODEL,
         "max_tokens": max_tokens,
@@ -51,30 +72,40 @@ async def call_claude(system_prompt: str, user_message: str, max_tokens: int = 4
         "messages": [{"role": "user", "content": user_message}],
     }
 
-    async with httpx.AsyncClient() as client:
+    client = await _get_claude_client()
+    last_error = None
+
+    for attempt in range(3):
         try:
-            resp = await client.post(
-                CLAUDE_API_URL,
-                headers=headers,
-                json=payload,
-                timeout=120.0,
-            )
+            resp = await client.post(CLAUDE_API_URL, json=payload)
             resp.raise_for_status()
             data = resp.json()
             content_blocks = data.get("content", [])
             text_parts = [b["text"] for b in content_blocks if b.get("type") == "text"]
-            return "\n".join(text_parts)
+            result = "\n".join(text_parts)
+            if not result.strip():
+                raise AIResponseError("AIから空の応答が返されました。")
+            return result
         except httpx.TimeoutException:
-            logger.error("Claude API timeout")
-            raise AIResponseError("AI応答がタイムアウトしました。しばらく待ってから再度お試しください。")
+            logger.warning(f"Claude API timeout (attempt {attempt + 1}/3)")
+            last_error = AIResponseError("AI応答がタイムアウトしました。しばらく待ってから再度お試しください。")
         except httpx.HTTPStatusError as e:
-            logger.error(f"Claude API HTTP error: {e.response.status_code} {e.response.text}")
-            raise AIResponseError(f"AI APIエラーが発生しました（{e.response.status_code}）。")
+            status = e.response.status_code
+            logger.error(f"Claude API HTTP error: {status} {e.response.text}")
+            if status == 429 or status >= 500:
+                # Retryable errors
+                last_error = AIResponseError(f"AI APIエラーが発生しました（{status}）。")
+                import asyncio
+                await asyncio.sleep(2 ** attempt)
+                continue
+            raise AIResponseError(f"AI APIエラーが発生しました（{status}）。")
         except AIResponseError:
             raise
         except Exception as e:
             logger.error(f"Claude API error: {e}")
             raise AIResponseError("AI応答の取得に失敗しました。")
+
+    raise last_error or AIResponseError("AI応答の取得に失敗しました。")
 
 
 def _extract_json_by_brace_counting(text: str, start: int) -> Optional[dict]:

@@ -6,7 +6,7 @@ from typing import Optional
 
 import database as db
 import case_manager
-from models import CaseType, CivilPhase, CriminalPhase
+from models import CaseType, CivilPhase, CriminalPhase, get_phase_display
 from line_client import resolve_mention
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ async def resolve_case(group_id: str, args: str) -> tuple[Optional[db.CaseRecord
         return cases[0], args, None
 
     # Multiple active cases — require explicit selection
-    case_list = "\n".join(f"  📌 {c.case_number} ({c.phase})" for c in cases)
+    case_list = "\n".join(f"  📌 {c.case_number} ({get_phase_display(c.phase)})" for c in cases)
     return None, args, (
         f"❌ 複数の事件が進行中です。事件番号を指定してください。\n"
         f"━━━━━━━━━━━━━━━━━━\n{case_list}\n\n"
@@ -98,17 +98,17 @@ async def handle_command(
         elif command == "/証拠":
             return await handle_evidence(group_id, user_id, args)
         elif command == "/和解":
-            return await handle_settlement_proposal(group_id, args)
+            return await handle_settlement_proposal(group_id, user_id, args)
         elif command == "/和解同意":
             return await handle_settlement_accept(group_id, user_id, args)
         elif command == "/和解拒否":
             return await handle_settlement_reject(group_id, user_id, args)
         elif command == "/起訴判断":
-            return await handle_prosecution_decision(group_id, args)
+            return await handle_prosecution_decision(group_id, user_id, args)
         elif command == "/罪状認否":
             return await handle_arraignment(group_id, user_id, args)
         elif command == "/次へ":
-            return await handle_next_phase(group_id, args)
+            return await handle_next_phase(group_id, user_id, args)
         elif command == "/最終陳述":
             return await handle_final_statement(group_id, user_id, args)
         elif command == "/判決":
@@ -236,11 +236,15 @@ async def handle_evidence(group_id: str, user_id: str, args: str) -> str:
     return await case_manager.submit_evidence(case.id, user_id, remaining)
 
 
-async def handle_settlement_proposal(group_id: str, args: str) -> str:
-    """Handle /和解 [事件番号]"""
+async def handle_settlement_proposal(group_id: str, user_id: str, args: str) -> str:
+    """Handle /和解 [事件番号] — parties only"""
     case, _, err = await resolve_case(group_id, args)
     if err:
         return err
+
+    party_err = check_party(case, user_id)
+    if party_err:
+        return party_err
 
     return await case_manager.propose_settlement(case.id)
 
@@ -263,11 +267,15 @@ async def handle_settlement_reject(group_id: str, user_id: str, args: str) -> st
     return await case_manager.reject_settlement(case.id, user_id)
 
 
-async def handle_prosecution_decision(group_id: str, args: str) -> str:
-    """Handle /起訴判断 [事件番号]"""
+async def handle_prosecution_decision(group_id: str, user_id: str, args: str) -> str:
+    """Handle /起訴判断 [事件番号] — parties only"""
     case, _, err = await resolve_case(group_id, args)
     if err:
         return err
+
+    party_err = check_party(case, user_id)
+    if party_err:
+        return party_err
 
     return await case_manager.decide_prosecution(case.id)
 
@@ -284,11 +292,15 @@ async def handle_arraignment(group_id: str, user_id: str, args: str) -> str:
     return await case_manager.arraignment(case.id, user_id, remaining)
 
 
-async def handle_next_phase(group_id: str, args: str) -> str:
-    """Handle /次へ [事件番号]"""
+async def handle_next_phase(group_id: str, user_id: str, args: str) -> str:
+    """Handle /次へ [事件番号] — parties only"""
     case, _, err = await resolve_case(group_id, args)
     if err:
         return err
+
+    party_err = check_party(case, user_id)
+    if party_err:
+        return party_err
 
     return await case_manager.proceed_criminal_phase(case.id)
 

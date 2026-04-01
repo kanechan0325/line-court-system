@@ -19,7 +19,8 @@ from config import (
 )
 import database as db
 from command_handler import handle_command
-from line_client import send_response, push_message
+from line_client import send_response, push_message, close_http_client
+from ai_engine import close_claude_client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,20 +32,28 @@ logger = logging.getLogger(__name__)
 # --- Self-ping to prevent Render sleep ---
 
 async def self_ping():
-    """Ping own health endpoint every 10 minutes to prevent Render free tier sleep."""
+    """Ping own health endpoint periodically to prevent Render free tier sleep."""
     if not RENDER_EXTERNAL_URL:
         logger.info("RENDER_EXTERNAL_URL not set, skipping self-ping")
         return
 
     url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/health"
+    backoff = 0
     async with httpx.AsyncClient() as client:
         while True:
             try:
-                await asyncio.sleep(SELF_PING_INTERVAL_SECONDS)
+                if backoff == 0:
+                    # First ping after short delay to let server start
+                    await asyncio.sleep(10)
+                else:
+                    await asyncio.sleep(SELF_PING_INTERVAL_SECONDS)
                 resp = await client.get(url, timeout=10.0)
-                logger.debug(f"Self-ping: {resp.status_code}")
+                logger.info(f"Self-ping: {resp.status_code}")
+                backoff = 0
             except Exception as e:
-                logger.warning(f"Self-ping failed: {e}")
+                backoff = min(backoff + 1, 3)
+                logger.warning(f"Self-ping failed (attempt backoff={backoff}): {e}")
+                await asyncio.sleep(2 ** backoff)
 
 
 # --- Lifecycle ---
@@ -65,6 +74,18 @@ async def lifespan(app: FastAPI):
         await ping_task
     except asyncio.CancelledError:
         pass
+
+    # Cancel all group workers gracefully
+    for gid, task in list(_group_workers.items()):
+        task.cancel()
+    for gid, task in list(_group_workers.items()):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    await close_http_client()
+    await close_claude_client()
     await db.close_pool()
     logger.info("Application shut down")
 
@@ -204,12 +225,14 @@ async def callback(request: Request):
     signature = request.headers.get("X-Line-Signature", "")
 
     if not verify_signature(body, signature):
-        raise HTTPException(status_code=403, detail="Invalid signature")
+        logger.warning(f"Invalid webhook signature from {request.client.host if request.client else 'unknown'}")
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     try:
         data = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        logger.warning("Invalid JSON in webhook request")
+        raise HTTPException(status_code=400, detail="Bad Request")
 
     events = data.get("events", [])
 

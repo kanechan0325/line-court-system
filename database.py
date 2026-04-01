@@ -14,7 +14,10 @@ _pool: Optional[asyncpg.Pool] = None
 async def init_pool():
     """Initialize the database connection pool."""
     global _pool
-    _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    _pool = await asyncpg.create_pool(
+        DATABASE_URL, min_size=2, max_size=10,
+        command_timeout=60,
+    )
     await create_tables()
     logger.info("Database pool initialized")
 
@@ -106,6 +109,13 @@ async def create_tables():
                 END IF;
             END $$;
         """)
+        # Create indexes for performance
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_group_id ON cases(group_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_type_level ON cases(case_type, court_level)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_case_id ON evidence(case_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_case_logs_case_id ON case_logs(case_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_precedents_case_number ON precedents(case_number)")
     logger.info("Database tables created/verified")
 
 

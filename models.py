@@ -117,6 +117,40 @@ def generate_case_number(case_type: CaseType, court_level: CourtLevel, seq: int)
     return f"R8-({symbol})-{seq:03d}"
 
 
+# Phase display names in Japanese
+PHASE_DISPLAY_NAMES = {
+    # Civil phases
+    "COMPLAINT_FILED": "訴状提出",
+    "REVIEW": "受理審査",
+    "CASE_NUMBERED": "事件番号付与",
+    "ANSWER_SUBMITTED": "答弁書提出済",
+    "ISSUE_ORGANIZATION": "争点整理",
+    "SETTLEMENT_PROPOSED": "和解勧告中",
+    "ORAL_ARGUMENT": "口頭弁論",
+    "EVIDENCE_EXAMINATION": "証拠調べ",
+    "FINAL_BRIEF": "最終準備書面",
+    "VERDICT": "判決",
+    "CLOSED": "終結",
+    # Criminal phases
+    "INVESTIGATION": "捜査",
+    "PROSECUTION_DECISION": "起訴判断",
+    "NOT_PROSECUTED": "不起訴",
+    "RIGHTS_NOTIFICATION": "権利告知",
+    "ARRAIGNMENT": "罪状認否",
+    "OPENING_PROCEDURE": "冒頭手続",
+    "OPENING_STATEMENT": "冒頭陳述",
+    "DEFENDANT_QUESTIONING": "被告人質問",
+    "PROSECUTION_CLOSING": "論告求刑",
+    "DEFENSE_CLOSING": "最終弁論",
+    "FINAL_STATEMENT": "最終陳述",
+}
+
+
+def get_phase_display(phase: str) -> str:
+    """Get Japanese display name for a phase."""
+    return PHASE_DISPLAY_NAMES.get(phase, phase)
+
+
 @dataclass
 class CaseRecord:
     id: int = 0

@@ -1,13 +1,15 @@
 """Case lifecycle management — state machine for civil and criminal cases."""
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+
+JST = timezone(timedelta(hours=9))
 
 from config import APPEAL_DEADLINE_DAYS
 from models import (
     CaseType, CourtLevel, CaseStatus, CivilPhase, CriminalPhase,
-    CaseRecord,
+    CaseRecord, get_phase_display,
 )
 import database as db
 import ai_engine
@@ -17,10 +19,14 @@ logger = logging.getLogger(__name__)
 
 
 def _format_appeal_deadline(deadline: Optional[datetime]) -> str:
-    """Format appeal deadline for display."""
+    """Format appeal deadline for display in JST."""
     if not deadline:
         return "14日以内"
-    return deadline.strftime("%Y年%m月%d日 %H:%M まで")
+    # Convert to JST for display
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    jst_deadline = deadline.astimezone(JST)
+    return jst_deadline.strftime("%Y年%m月%d日 %H:%M まで（日本時間）")
 
 
 def _format_logs(logs: list[dict]) -> str:
@@ -347,13 +353,24 @@ async def submit_evidence(case_id: int, user_id: str, content: str) -> str:
     elif case.case_type == CaseType.CRIMINAL and case.phase != CriminalPhase.EVIDENCE_EXAMINATION:
         await db.update_case_phase(case_id, CriminalPhase.EVIDENCE_EXAMINATION)
 
+    # Judge reviews evidence admissibility
+    admission_note = ""
+    try:
+        admission_note = await ai_engine.judge_respond(
+            case, content,
+            f"証拠として提出された内容の証拠能力・関連性を簡潔に評価してください:\n{content}",
+        )
+    except AIResponseError:
+        admission_note = "（証拠の評価は判決時に行います）"
+
+    role = "原告" if user_id == case.plaintiff_id else "被告"
     return (
         f"⚖️ 【{case.case_number}】証拠提出\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"証拠番号: {evidence.id}\n"
-        f"提出者: {'原告' if user_id == case.plaintiff_id else '被告'}\n"
+        f"提出者: {role}\n"
         f"内容: {content}\n\n"
-        f"証拠は記録されました。"
+        f"⚖️ 【裁判官の証拠評価】\n{admission_note}"
     )
 
 
@@ -817,7 +834,11 @@ async def file_appeal(case_id: int, appellant_id: str) -> str:
         return "❌ 判決が出ていない事件には控訴できません。"
 
     # Check appeal deadline
-    if case.appeal_deadline and datetime.utcnow() > case.appeal_deadline:
+    now_utc = datetime.now(timezone.utc)
+    deadline = case.appeal_deadline
+    if deadline and deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    if deadline and now_utc > deadline:
         return "❌ 控訴期限（14日）を過ぎています。"
 
     # Determine next court level
@@ -833,8 +854,19 @@ async def file_appeal(case_id: int, appellant_id: str) -> str:
     closed_phase = CivilPhase.CLOSED if case.case_type == CaseType.CIVIL else CriminalPhase.CLOSED
     await db.update_case_phase(case_id, closed_phase)
 
-    # Create new case in higher court
-    initial_phase = CivilPhase.COMPLAINT_FILED if case.case_type == CaseType.CIVIL else CriminalPhase.COMPLAINT_FILED
+    # Create new case in higher court — start from issue organization (civil) or evidence (criminal)
+    # since lower court findings carry over
+    if case.case_type == CaseType.CIVIL:
+        initial_phase = CivilPhase.ISSUE_ORGANIZATION
+    else:
+        initial_phase = CriminalPhase.EVIDENCE_EXAMINATION
+
+    appeal_text = (
+        f"【控訴審】原審事件番号: {case.case_number}\n"
+        f"原審判決: {case.verdict_text or '(判決文なし)'}\n\n"
+        f"控訴理由: 原審判決に不服があるため控訴する。"
+    )
+
     new_case = await db.create_case(
         case_type=case.case_type,
         court_level=next_level,
@@ -842,31 +874,35 @@ async def file_appeal(case_id: int, appellant_id: str) -> str:
         plaintiff_id=case.plaintiff_id,
         defendant_id=case.defendant_id,
         group_id=case.group_id,
-        complaint_text=f"【控訴】原審事件番号: {case.case_number}\n原審判決: {case.verdict_text or '(判決文なし)'}\n\n控訴理由: 原審判決に不服があるため控訴する。",
+        complaint_text=appeal_text,
         parent_case_id=case.id,
     )
 
-    # Auto-review — call AI first, then update phase
-    new_case.phase = CivilPhase.REVIEW if case.case_type == CaseType.CIVIL else CriminalPhase.INVESTIGATION
-
+    # AI reviews the appeal
+    new_case.phase = initial_phase
     try:
         review = await ai_engine.judge_review_complaint(new_case)
     except AIResponseError:
         review = "（受理審査の生成に失敗しました。手続きは進行可能です。）"
 
-    await db.update_case_phase(new_case.id, new_case.phase)
-    await db.add_case_log(new_case.id, new_case.phase, "JUDGE", review)
+    await db.add_case_log(new_case.id, initial_phase, "JUDGE", review)
 
     court_name = "高等裁判所" if next_level == CourtLevel.HIGH else "最高裁判所"
+    if case.case_type == CaseType.CIVIL:
+        next_action = "/弁論 で控訴理由の弁論、/証拠 で新証拠を提出、/判決 で判決を求められます。"
+    else:
+        next_action = "/証拠 で新証拠を提出、/弁論 で主張を追加、/次へ でフェーズを進められます。"
+
     return (
         f"⚖️ 【控訴受理】\n"
         f"新事件番号: {new_case.case_number}\n"
         f"審級: {court_name}\n"
         f"原審事件番号: {case.case_number}\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
-        f"📋 【受理審査】\n{review}\n\n"
+        f"📋 【控訴審受理審査】\n{review}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"{'被告は /答弁 で答弁書を提出してください。' if case.case_type == CaseType.CIVIL else '/起訴判断 で手続きを進めてください。'}"
+        f"原審の記録を引き継いで審理を行います。\n"
+        f"{next_action}"
     )
 
 
@@ -880,7 +916,7 @@ async def get_case_list(group_id: str) -> str:
     for c in cases:
         case_type = "民事" if c.case_type == CaseType.CIVIL else "刑事"
         lines.append(f"\n📌 {c.case_number} ({case_type})")
-        lines.append(f"   フェーズ: {c.phase}")
+        lines.append(f"   フェーズ: {get_phase_display(c.phase)}")
         lines.append(f"   状態: {c.status}")
     return "\n".join(lines)
 
@@ -898,7 +934,7 @@ async def get_case_detail(case_id: int) -> str:
         f"⚖️ 【事件詳細】{case.case_number}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"種別: {case_type} | 審級: {court}\n"
-        f"フェーズ: {case.phase}\n"
+        f"フェーズ: {get_phase_display(case.phase)}\n"
         f"状態: {case.status}\n"
         f"提訴日: {case.created_at}\n"
     )
