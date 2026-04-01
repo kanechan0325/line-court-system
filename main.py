@@ -91,7 +91,7 @@ async def health():
     return {"status": "ok", "service": "line-court-system"}
 
 
-@app.post("/callback")
+@app.post("/webhook")
 async def callback(request: Request):
     """LINE Webhook callback endpoint."""
     body = await request.body()
