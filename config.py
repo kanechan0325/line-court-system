@@ -1,0 +1,24 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# LINE Messaging API
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+
+# Claude API
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL = "claude-sonnet-4-20250514"
+
+# Database
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# Render
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+
+# Constants
+MAX_LINE_MESSAGE_LENGTH = 5000
+MAX_LINE_MESSAGES_PER_REPLY = 5
+APPEAL_DEADLINE_DAYS = 14
+SELF_PING_INTERVAL_SECONDS = 600
