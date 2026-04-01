@@ -98,17 +98,6 @@ async def create_tables():
 
 # --- Case CRUD ---
 
-async def get_next_case_sequence(case_type: str, court_level: str) -> int:
-    """Get the next sequence number for case numbering."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT COUNT(*) as cnt FROM cases WHERE case_type = $1 AND court_level = $2",
-            case_type, court_level
-        )
-        return (row["cnt"] or 0) + 1
-
-
 async def create_case(
     case_type: str,
     court_level: str,
@@ -119,28 +108,43 @@ async def create_case(
     complaint_text: str,
     parent_case_id: Optional[int] = None,
 ) -> CaseRecord:
-    """Create a new case and return the record."""
-    seq = await get_next_case_sequence(case_type, court_level)
-    case_number = generate_case_number(
-        CaseType(case_type), CourtLevel(court_level), seq
-    )
-
+    """Create a new case with atomic case number generation."""
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO cases (
-                case_number, case_type, court_level, phase,
-                plaintiff_id, defendant_id, group_id, complaint_text,
-                parent_case_id, status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ACTIVE')
-            RETURNING *
-            """,
-            case_number, case_type, court_level, phase,
-            plaintiff_id, defendant_id, group_id, complaint_text,
-            parent_case_id,
-        )
-    return _row_to_case(row)
+
+    # Retry loop for race condition on UNIQUE constraint
+    for attempt in range(3):
+        async with pool.acquire() as conn:
+            # Atomic: get next sequence and insert in same transaction
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT COALESCE(MAX(id), 0) + 1 as seq FROM cases WHERE case_type = $1 AND court_level = $2",
+                    case_type, court_level
+                )
+                seq = row["seq"]
+                case_number = generate_case_number(
+                    CaseType(case_type), CourtLevel(court_level), seq
+                )
+                try:
+                    result = await conn.fetchrow(
+                        """
+                        INSERT INTO cases (
+                            case_number, case_type, court_level, phase,
+                            plaintiff_id, defendant_id, group_id, complaint_text,
+                            parent_case_id, status
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ACTIVE')
+                        RETURNING *
+                        """,
+                        case_number, case_type, court_level, phase,
+                        plaintiff_id, defendant_id, group_id, complaint_text,
+                        parent_case_id,
+                    )
+                    return _row_to_case(result)
+                except Exception as e:
+                    if "unique" in str(e).lower() and attempt < 2:
+                        logger.warning(f"Case number collision, retrying: {e}")
+                        continue
+                    raise
+    raise RuntimeError("Failed to generate unique case number after retries")
 
 
 async def get_case(case_id: int) -> Optional[CaseRecord]:

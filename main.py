@@ -69,6 +69,35 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="LINE AI司法システム", lifespan=lifespan)
 
+# Per-group event queues for ordering
+_group_queues: dict[str, asyncio.Queue] = {}
+_group_workers: dict[str, asyncio.Task] = {}
+
+
+async def _group_worker(group_id: str):
+    """Process events for a single group sequentially."""
+    queue = _group_queues[group_id]
+    while True:
+        event = await queue.get()
+        try:
+            await process_event(event)
+        except Exception as e:
+            logger.error(f"Group worker error for {group_id}: {e}", exc_info=True)
+        finally:
+            queue.task_done()
+
+
+def enqueue_event(event: dict):
+    """Enqueue an event for sequential processing per group."""
+    source = event.get("source", {})
+    group_id = source.get("groupId", source.get("userId", "unknown"))
+
+    if group_id not in _group_queues:
+        _group_queues[group_id] = asyncio.Queue()
+        _group_workers[group_id] = asyncio.create_task(_group_worker(group_id))
+
+    _group_queues[group_id].put_nowait(event)
+
 
 # --- Signature verification ---
 
@@ -108,7 +137,7 @@ async def callback(request: Request):
     events = data.get("events", [])
 
     for event in events:
-        asyncio.create_task(process_event(event))
+        enqueue_event(event)
 
     return {"status": "ok"}
 

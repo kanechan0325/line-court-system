@@ -1,9 +1,10 @@
 """Case lifecycle management — state machine for civil and criminal cases."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
+from config import APPEAL_DEADLINE_DAYS
 from models import (
     CaseType, CourtLevel, CaseStatus, CivilPhase, CriminalPhase,
     CaseRecord,
@@ -12,6 +13,13 @@ import database as db
 import ai_engine
 
 logger = logging.getLogger(__name__)
+
+
+def _format_appeal_deadline(deadline: Optional[datetime]) -> str:
+    """Format appeal deadline for display."""
+    if not deadline:
+        return "14日以内"
+    return deadline.strftime("%Y年%m月%d日 %H:%M まで")
 
 
 def _format_logs(logs: list[dict]) -> str:
@@ -105,7 +113,7 @@ async def submit_answer(case_id: int, defendant_id: str, answer_text: str) -> st
     if case.defendant_id != defendant_id:
         return "❌ あなたはこの事件の被告ではありません。"
     if case.phase not in (CivilPhase.CASE_NUMBERED, CivilPhase.ANSWER_SUBMITTED):
-        return "❌ 現在のフェーズでは答弁書を提出できません。"
+        return f"❌ 現在のフェーズ（{case.phase}）では答弁書を提出できません。\n答弁書は事件番号付与後に提出してください。"
 
     await db.update_case_answer(case_id, answer_text)
     await db.update_case_phase(case_id, CivilPhase.ANSWER_SUBMITTED)
@@ -138,8 +146,12 @@ async def propose_settlement(case_id: int) -> str:
         return "❌ 事件が見つかりません。"
     if case.case_type != CaseType.CIVIL:
         return "❌ 和解勧告は民事事件のみです。"
-    if case.phase in (CivilPhase.VERDICT, CivilPhase.CLOSED):
-        return "❌ この事件は既に終結しています。"
+    allowed = (
+        CivilPhase.ISSUE_ORGANIZATION, CivilPhase.ORAL_ARGUMENT,
+        CivilPhase.EVIDENCE_EXAMINATION,
+    )
+    if case.phase not in allowed:
+        return f"❌ 現在のフェーズ（{case.phase}）では和解勧告を行えません。\n争点整理〜証拠調べの段階で /和解 を使用してください。"
 
     await db.update_case_phase(case_id, CivilPhase.SETTLEMENT_PROPOSED)
     logs = await db.get_case_logs(case_id)
@@ -217,15 +229,21 @@ async def submit_argument(case_id: int, user_id: str, content: str) -> str:
         return "❌ 事件が見つかりません。"
     if case.status != CaseStatus.ACTIVE:
         return "❌ この事件は既に終結しています。"
+    if user_id not in (case.plaintiff_id, case.defendant_id):
+        return "❌ あなたはこの事件の当事者ではありません。"
 
-    # Allow arguments in most active phases
-    allowed_phases = [
-        CivilPhase.ISSUE_ORGANIZATION, CivilPhase.ORAL_ARGUMENT,
-        CivilPhase.EVIDENCE_EXAMINATION, CivilPhase.FINAL_BRIEF,
-        CriminalPhase.EVIDENCE_EXAMINATION, CriminalPhase.DEFENDANT_QUESTIONING,
-    ]
-    if case.phase not in [p.value if hasattr(p, 'value') else p for p in allowed_phases]:
-        return "❌ 現在のフェーズでは弁論できません。"
+    # Allow arguments in appropriate phases
+    if case.case_type == CaseType.CIVIL:
+        allowed_phases = (
+            CivilPhase.ISSUE_ORGANIZATION, CivilPhase.ORAL_ARGUMENT,
+            CivilPhase.EVIDENCE_EXAMINATION,
+        )
+    else:
+        allowed_phases = (
+            CriminalPhase.EVIDENCE_EXAMINATION, CriminalPhase.DEFENDANT_QUESTIONING,
+        )
+    if case.phase not in allowed_phases:
+        return f"❌ 現在のフェーズ（{case.phase}）では弁論できません。\n/事件詳細 で現在のフェーズを確認してください。"
 
     if case.case_type == CaseType.CIVIL and case.phase != CivilPhase.ORAL_ARGUMENT:
         await db.update_case_phase(case_id, CivilPhase.ORAL_ARGUMENT)
@@ -258,6 +276,8 @@ async def submit_evidence(case_id: int, user_id: str, content: str) -> str:
         return "❌ 事件が見つかりません。"
     if case.status != CaseStatus.ACTIVE:
         return "❌ この事件は既に終結しています。"
+    if user_id not in (case.plaintiff_id, case.defendant_id):
+        return "❌ あなたはこの事件の当事者ではありません。"
 
     evidence = await db.add_evidence(case_id, user_id, content)
     await db.add_case_log(case_id, case.phase, user_id, f"証拠提出: {content}")
@@ -285,6 +305,21 @@ async def render_civil_verdict(case_id: int) -> str:
     if case.phase in (CivilPhase.VERDICT, CivilPhase.CLOSED):
         return "❌ この事件は既に判決済みです。"
 
+    # Phase prerequisite: must have had at least oral argument or evidence
+    required_phases = (
+        CivilPhase.ORAL_ARGUMENT, CivilPhase.EVIDENCE_EXAMINATION,
+        CivilPhase.FINAL_BRIEF, CivilPhase.SETTLEMENT_PROPOSED,
+    )
+    if case.phase not in required_phases:
+        return (
+            f"❌ 判決の前に弁論または証拠調べが必要です（現在: {case.phase}）。\n"
+            f"/弁論 で口頭弁論、/証拠 で証拠を提出してください。"
+        )
+
+    # Transition through FINAL_BRIEF before verdict
+    await db.update_case_phase(case_id, CivilPhase.FINAL_BRIEF)
+    await db.add_case_log(case_id, CivilPhase.FINAL_BRIEF, "JUDGE", "最終準備書面段階を経て判決に移行")
+
     logs = await db.get_case_logs(case_id)
     evidences = await db.get_evidence(case_id)
     precedents = await db.search_precedents(case.complaint_text[:50])
@@ -294,28 +329,37 @@ async def render_civil_verdict(case_id: int) -> str:
     )
 
     sentence = None
+    summary = verdict_text[:100] if verdict_text else ""
+    verdict_label = ""
     if verdict_data:
         sentence = verdict_data.get("sentence")
-        # Save as precedent
-        await db.save_precedent(
-            case_number=case.case_number,
-            case_type=case.case_type,
-            summary=verdict_data.get("summary", ""),
-            verdict=verdict_data.get("verdict", ""),
-            sentence=sentence,
-            judgment_text=verdict_text,
-        )
+        summary = verdict_data.get("summary", summary)
+        verdict_label = verdict_data.get("verdict", "")
+
+    # Always save as precedent (fallback if JSON parse failed)
+    await db.save_precedent(
+        case_number=case.case_number,
+        case_type=case.case_type,
+        summary=summary,
+        verdict=verdict_label or "UNKNOWN",
+        sentence=sentence,
+        judgment_text=verdict_text,
+    )
 
     await db.update_case_verdict(case_id, verdict_text, sentence)
     await db.update_case_phase(case_id, CivilPhase.VERDICT)
     await db.add_case_log(case_id, CivilPhase.VERDICT, "JUDGE", verdict_text)
+
+    # Refresh case to get appeal_deadline
+    case = await db.get_case(case_id)
+    deadline_str = _format_appeal_deadline(case.appeal_deadline if case else None)
 
     return (
         f"⚖️ 【{case.case_number}】判決\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
         f"{verdict_text}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"控訴期限: 14日以内\n"
+        f"控訴期限: {deadline_str}\n"
         f"/控訴 で控訴できます。"
     )
 
@@ -421,7 +465,7 @@ async def arraignment(case_id: int, defendant_id: str, plea: str) -> str:
     if case.defendant_id != defendant_id:
         return "❌ あなたはこの事件の被告人ではありません。"
     if case.phase != CriminalPhase.RIGHTS_NOTIFICATION:
-        return "❌ 現在のフェーズでは罪状認否を行えません。"
+        return f"❌ 現在のフェーズ（{case.phase}）では罪状認否を行えません。\n権利告知後に /罪状認否 を使用してください。"
 
     await db.update_case_phase(case_id, CriminalPhase.ARRAIGNMENT)
     await db.add_case_log(case_id, CriminalPhase.ARRAIGNMENT, defendant_id, f"罪状認否: {plea}")
@@ -543,13 +587,24 @@ async def proceed_criminal_phase(case_id: int) -> str:
         )
 
     elif current_phase == CriminalPhase.DEFENSE_CLOSING:
-        return "❌ 被告人の最終陳述を待っています。/最終陳述 で最終陳述を行ってください。"
+        # Waive final statement and proceed
+        await db.update_case_phase(case_id, CriminalPhase.FINAL_STATEMENT)
+        await db.add_case_log(
+            case_id, CriminalPhase.FINAL_STATEMENT, "JUDGE",
+            "被告人は最終陳述の権利を放棄したものとみなす。"
+        )
+        return (
+            f"⚖️ 【{case.case_number}】最終陳述省略\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"被告人は最終陳述の権利を放棄したものとみなします。\n"
+            f"/判決 で判決を求めてください。"
+        )
 
     elif current_phase == CriminalPhase.FINAL_STATEMENT:
         return "❌ 最終陳述は完了しています。/判決 で判決を求めてください。"
 
     else:
-        return f"❌ 現在のフェーズ（{current_phase}）では /次へ は使用できません。"
+        return f"❌ 現在のフェーズ（{current_phase}）では /次へ は使用できません。\n/事件詳細 で現在のフェーズを確認してください。"
 
 
 async def final_statement(case_id: int, defendant_id: str, content: str) -> str:
@@ -560,7 +615,7 @@ async def final_statement(case_id: int, defendant_id: str, content: str) -> str:
     if case.defendant_id != defendant_id:
         return "❌ あなたはこの事件の被告人ではありません。"
     if case.phase != CriminalPhase.DEFENSE_CLOSING:
-        return "❌ 現在のフェーズでは最終陳述を行えません。"
+        return f"❌ 現在のフェーズ（{case.phase}）では最終陳述を行えません。\n最終弁論の後に /最終陳述 を使用してください。"
 
     await db.update_case_phase(case_id, CriminalPhase.FINAL_STATEMENT)
     await db.add_case_log(case_id, CriminalPhase.FINAL_STATEMENT, defendant_id, content)
@@ -585,6 +640,17 @@ async def render_criminal_verdict(case_id: int) -> str:
     if case.phase in (CriminalPhase.VERDICT, CriminalPhase.CLOSED):
         return "❌ この事件は既に判決済みです。"
 
+    # Phase prerequisite: must have had final statement or waiver
+    required_phases = (
+        CriminalPhase.FINAL_STATEMENT, CriminalPhase.DEFENSE_CLOSING,
+        CriminalPhase.PROSECUTION_CLOSING,
+    )
+    if case.phase not in required_phases:
+        return (
+            f"❌ 判決の前に論告求刑・最終弁論・最終陳述が必要です（現在: {case.phase}）。\n"
+            f"/次へ でフェーズを進めてください。"
+        )
+
     logs = await db.get_case_logs(case_id)
     evidences = await db.get_evidence(case_id)
     precedents = await db.search_precedents(case.complaint_text[:50])
@@ -594,27 +660,36 @@ async def render_criminal_verdict(case_id: int) -> str:
     )
 
     sentence = None
+    summary = verdict_text[:100] if verdict_text else ""
+    verdict_label = ""
     if verdict_data:
         sentence = verdict_data.get("sentence")
-        await db.save_precedent(
-            case_number=case.case_number,
-            case_type=case.case_type,
-            summary=verdict_data.get("summary", ""),
-            verdict=verdict_data.get("verdict", ""),
-            sentence=sentence,
-            judgment_text=verdict_text,
-        )
+        summary = verdict_data.get("summary", summary)
+        verdict_label = verdict_data.get("verdict", "")
+
+    # Always save as precedent
+    await db.save_precedent(
+        case_number=case.case_number,
+        case_type=case.case_type,
+        summary=summary,
+        verdict=verdict_label or "UNKNOWN",
+        sentence=sentence,
+        judgment_text=verdict_text,
+    )
 
     await db.update_case_verdict(case_id, verdict_text, sentence)
     await db.update_case_phase(case_id, CriminalPhase.VERDICT)
     await db.add_case_log(case_id, CriminalPhase.VERDICT, "JUDGE", verdict_text)
+
+    case = await db.get_case(case_id)
+    deadline_str = _format_appeal_deadline(case.appeal_deadline if case else None)
 
     return (
         f"⚖️ 【{case.case_number}】判決\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
         f"{verdict_text}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"控訴期限: 14日以内\n"
+        f"控訴期限: {deadline_str}\n"
         f"/控訴 で控訴できます。"
     )
 

@@ -210,8 +210,14 @@ def get_prosecutor_charge_decision_prompt(case: CaseRecord, investigation: str) 
 起訴する場合は適用罪名と法定刑を明示してください。
 不起訴の場合はその理由を明示してください。
 
-結論を以下の形式で示してください：
-【起訴/不起訴判断】起訴 または 不起訴（理由）"""
+必ず以下のJSON形式を結論の最後に含めてください：
+```json
+{{
+    "decision": "PROSECUTE" または "NOT_PROSECUTE",
+    "charge": "適用罪名（起訴の場合）",
+    "reason": "判断理由の要約"
+}}
+```"""
 
 
 def get_prosecutor_closing_prompt(case: CaseRecord, logs: str, evidence: str) -> str:

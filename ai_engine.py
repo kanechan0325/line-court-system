@@ -68,8 +68,8 @@ async def call_claude(system_prompt: str, user_message: str, max_tokens: int = 4
             return "【システムエラー】AI応答の取得に失敗しました。"
 
 
-def parse_verdict_json(text: str) -> Optional[dict]:
-    """Extract verdict JSON from AI response text."""
+def _extract_json_from_text(text: str, key_hint: str) -> Optional[dict]:
+    """Extract a JSON object from AI response text, looking for a specific key."""
     # Try to find JSON in ```json ... ``` blocks
     json_match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
     if json_match:
@@ -78,8 +78,8 @@ def parse_verdict_json(text: str) -> Optional[dict]:
         except json.JSONDecodeError:
             pass
 
-    # Try to find raw JSON object
-    json_match = re.search(r'\{\s*"verdict"\s*:', text, re.DOTALL)
+    # Try to find raw JSON object by key hint
+    json_match = re.search(rf'\{{\s*"{key_hint}"\s*:', text, re.DOTALL)
     if json_match:
         start = json_match.start()
         brace_count = 0
@@ -95,6 +95,16 @@ def parse_verdict_json(text: str) -> Optional[dict]:
                         break
 
     return None
+
+
+def parse_verdict_json(text: str) -> Optional[dict]:
+    """Extract verdict JSON from AI response text."""
+    return _extract_json_from_text(text, "verdict")
+
+
+def parse_prosecution_json(text: str) -> Optional[dict]:
+    """Extract prosecution decision JSON from AI response text."""
+    return _extract_json_from_text(text, "decision")
 
 
 # --- Judge functions ---
@@ -151,7 +161,16 @@ async def prosecutor_decide_charge(case: CaseRecord, investigation: str) -> tupl
     system = get_prosecutor_charge_decision_prompt(case, investigation)
     user_msg = "捜査結果に基づき、起訴/不起訴の判断を行ってください。"
     response = await call_claude(system, user_msg)
-    is_prosecuted = "起訴" in response and "不起訴" not in response.split("【起訴/不起訴判断】")[-1]
+
+    # Try JSON-based detection first
+    decision_data = parse_prosecution_json(response)
+    if decision_data and "decision" in decision_data:
+        is_prosecuted = decision_data["decision"] == "PROSECUTE"
+        return response, is_prosecuted
+
+    # Fallback: text-based detection
+    logger.warning("Prosecution decision JSON not found, falling back to text detection")
+    is_prosecuted = "起訴" in response and "不起訴" not in response.split("起訴")[-1][:20]
     return response, is_prosecuted
 
 
