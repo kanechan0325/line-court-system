@@ -11,6 +11,7 @@ from models import (
 )
 import database as db
 import ai_engine
+from ai_engine import AIResponseError
 
 logger = logging.getLogger(__name__)
 
@@ -77,17 +78,23 @@ async def file_civil_complaint(
     )
     await db.add_case_log(case.id, CivilPhase.COMPLAINT_FILED, plaintiff_id, complaint_text)
 
-    # AI judge reviews
-    await db.update_case_phase(case.id, CivilPhase.REVIEW)
+    # AI judge reviews — call AI first, then update phase
     case.phase = CivilPhase.REVIEW
-    review = await ai_engine.judge_review_complaint(case)
+    try:
+        review = await ai_engine.judge_review_complaint(case)
+    except AIResponseError as e:
+        return f"❌ 【{case.case_number}】受理審査中にエラーが発生しました: {e}\n再度 /訴状 で提出してください。"
+
+    await db.update_case_phase(case.id, CivilPhase.REVIEW)
     await db.add_case_log(case.id, CivilPhase.REVIEW, "JUDGE", review)
 
-    # Accept (default behavior) — assign case number
-    await db.update_case_phase(case.id, CivilPhase.CASE_NUMBERED)
+    # Clerk creates record — call AI first, then update phase
+    try:
+        record = await ai_engine.clerk_create_record(case, "訴状受理", complaint_text)
+    except AIResponseError:
+        record = "（書記官記録の作成に失敗しました）"
 
-    # Clerk creates record
-    record = await ai_engine.clerk_create_record(case, "訴状受理", complaint_text)
+    await db.update_case_phase(case.id, CivilPhase.CASE_NUMBERED)
     await db.add_case_log(case.id, CivilPhase.CASE_NUMBERED, "CLERK", record)
 
     response = (
@@ -115,17 +122,35 @@ async def submit_answer(case_id: int, defendant_id: str, answer_text: str) -> st
     if case.phase not in (CivilPhase.CASE_NUMBERED, CivilPhase.ANSWER_SUBMITTED):
         return f"❌ 現在のフェーズ（{case.phase}）では答弁書を提出できません。\n答弁書は事件番号付与後に提出してください。"
 
+    is_resubmission = case.phase == CivilPhase.ANSWER_SUBMITTED
+
     await db.update_case_answer(case_id, answer_text)
-    await db.update_case_phase(case_id, CivilPhase.ANSWER_SUBMITTED)
     await db.add_case_log(case_id, CivilPhase.ANSWER_SUBMITTED, defendant_id, answer_text)
 
-    # Proceed to issue organization
+    if is_resubmission:
+        # Resubmission: update answer only, don't re-run issue organization
+        return (
+            f"⚖️ 【{case.case_number}】答弁書更新\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"📋 【答弁書（更新）】\n{answer_text}\n\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"答弁書が更新されました。"
+        )
+
+    await db.update_case_phase(case_id, CivilPhase.ANSWER_SUBMITTED)
+
+    # First submission: proceed to issue organization
     case.answer_text = answer_text
     case.phase = CivilPhase.ISSUE_ORGANIZATION
-    await db.update_case_phase(case_id, CivilPhase.ISSUE_ORGANIZATION)
 
     logs = await db.get_case_logs(case_id)
-    issues = await ai_engine.judge_organize_issues(case, _format_logs(logs))
+    try:
+        issues = await ai_engine.judge_organize_issues(case, _format_logs(logs))
+    except AIResponseError as e:
+        # Phase stays at ANSWER_SUBMITTED so user can retry
+        return f"❌ 【{case.case_number}】争点整理中にエラーが発生しました: {e}\n再度 /答弁 で答弁書を提出してください。"
+
+    await db.update_case_phase(case_id, CivilPhase.ISSUE_ORGANIZATION)
     await db.add_case_log(case_id, CivilPhase.ISSUE_ORGANIZATION, "JUDGE", issues)
 
     return (
@@ -153,10 +178,19 @@ async def propose_settlement(case_id: int) -> str:
     if case.phase not in allowed:
         return f"❌ 現在のフェーズ（{case.phase}）では和解勧告を行えません。\n争点整理〜証拠調べの段階で /和解 を使用してください。"
 
-    await db.update_case_phase(case_id, CivilPhase.SETTLEMENT_PROPOSED)
+    pre_settlement_phase = case.phase
     logs = await db.get_case_logs(case_id)
-    settlement = await ai_engine.judge_settlement_proposal(case, _format_logs(logs))
-    await db.add_case_log(case_id, CivilPhase.SETTLEMENT_PROPOSED, "JUDGE", settlement)
+
+    try:
+        settlement = await ai_engine.judge_settlement_proposal(case, _format_logs(logs))
+    except AIResponseError as e:
+        return f"❌ 【{case.case_number}】和解案生成中にエラーが発生しました: {e}\n再度 /和解 をお試しください。"
+
+    await db.update_case_phase(case_id, CivilPhase.SETTLEMENT_PROPOSED)
+    await db.add_case_log(
+        case_id, CivilPhase.SETTLEMENT_PROPOSED, "JUDGE", settlement,
+        action_type=f"SETTLEMENT_FROM:{pre_settlement_phase}",
+    )
 
     return (
         f"⚖️ 【{case.case_number}】和解勧告\n"
@@ -177,13 +211,16 @@ async def accept_settlement(case_id: int, user_id: str) -> str:
     if user_id not in (case.plaintiff_id, case.defendant_id):
         return "❌ あなたはこの事件の当事者ではありません。"
 
-    await db.add_case_log(case_id, CivilPhase.SETTLEMENT_PROPOSED, user_id, "和解に同意")
+    await db.add_case_log(
+        case_id, CivilPhase.SETTLEMENT_PROPOSED, user_id, "和解に同意",
+        action_type="SETTLEMENT_ACCEPT",
+    )
 
-    # Check if both parties agreed
+    # Check if both parties agreed (using action_type for reliable detection)
     logs = await db.get_case_logs(case_id)
     agreed_parties = set()
     for log in logs:
-        if log["phase"] == CivilPhase.SETTLEMENT_PROPOSED and "和解に同意" in log["content"]:
+        if log.get("action_type") == "SETTLEMENT_ACCEPT":
             agreed_parties.add(log["actor"])
 
     if case.plaintiff_id in agreed_parties and case.defendant_id in agreed_parties:
@@ -211,14 +248,25 @@ async def reject_settlement(case_id: int, user_id: str) -> str:
         return "❌ あなたはこの事件の当事者ではありません。"
 
     await db.add_case_log(case_id, CivilPhase.SETTLEMENT_PROPOSED, user_id, "和解を拒否")
-    await db.update_case_phase(case_id, CivilPhase.ORAL_ARGUMENT)
+
+    # Restore the phase from before settlement was proposed
+    restore_phase = CivilPhase.ORAL_ARGUMENT  # default fallback
+    logs = await db.get_case_logs(case_id)
+    for log in logs:
+        action = log.get("action_type") or ""
+        if action.startswith("SETTLEMENT_FROM:"):
+            restore_phase = action.split(":", 1)[1]
+            break
+
+    await db.update_case_phase(case_id, restore_phase)
 
     role = "原告" if user_id == case.plaintiff_id else "被告"
+    phase_label = {"ORAL_ARGUMENT": "口頭弁論", "EVIDENCE_EXAMINATION": "証拠調べ", "ISSUE_ORGANIZATION": "争点整理"}.get(restore_phase, restore_phase)
     return (
         f"⚖️ 【{case.case_number}】和解拒否\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"{role}が和解を拒否しました。\n"
-        f"口頭弁論に移行します。/弁論 で弁論を行ってください。"
+        f"{phase_label}に戻ります。/弁論 で弁論を行ってください。"
     )
 
 
@@ -245,16 +293,19 @@ async def submit_argument(case_id: int, user_id: str, content: str) -> str:
     if case.phase not in allowed_phases:
         return f"❌ 現在のフェーズ（{case.phase}）では弁論できません。\n/事件詳細 で現在のフェーズを確認してください。"
 
-    if case.case_type == CaseType.CIVIL and case.phase != CivilPhase.ORAL_ARGUMENT:
-        await db.update_case_phase(case_id, CivilPhase.ORAL_ARGUMENT)
-
     await db.add_case_log(case_id, case.phase, user_id, content)
 
     # Judge responds
-    logs = await db.get_case_logs(case_id)
-    judge_response = await ai_engine.judge_respond(
-        case, content, f"口頭弁論における当事者の主張:\n{content}"
-    )
+    try:
+        judge_response = await ai_engine.judge_respond(
+            case, content, f"口頭弁論における当事者の主張:\n{content}"
+        )
+    except AIResponseError as e:
+        return f"❌ 【{case.case_number}】裁判官応答中にエラーが発生しました: {e}\n再度 /弁論 をお試しください。"
+
+    if case.case_type == CaseType.CIVIL and case.phase != CivilPhase.ORAL_ARGUMENT:
+        await db.update_case_phase(case_id, CivilPhase.ORAL_ARGUMENT)
+
     await db.add_case_log(case_id, case.phase, "JUDGE", judge_response)
 
     role = "原告" if user_id == case.plaintiff_id else "被告"
@@ -279,11 +330,22 @@ async def submit_evidence(case_id: int, user_id: str, content: str) -> str:
     if user_id not in (case.plaintiff_id, case.defendant_id):
         return "❌ あなたはこの事件の当事者ではありません。"
 
+    # Phase restriction for criminal cases
+    if case.case_type == CaseType.CRIMINAL:
+        allowed_criminal = (
+            CriminalPhase.OPENING_STATEMENT, CriminalPhase.EVIDENCE_EXAMINATION,
+            CriminalPhase.DEFENDANT_QUESTIONING,
+        )
+        if case.phase not in allowed_criminal:
+            return f"❌ 現在のフェーズ（{case.phase}）では証拠を提出できません。\n冒頭陳述〜被告人質問の段階で /証拠 を使用してください。"
+
     evidence = await db.add_evidence(case_id, user_id, content)
     await db.add_case_log(case_id, case.phase, user_id, f"証拠提出: {content}")
 
     if case.case_type == CaseType.CIVIL and case.phase != CivilPhase.EVIDENCE_EXAMINATION:
         await db.update_case_phase(case_id, CivilPhase.EVIDENCE_EXAMINATION)
+    elif case.case_type == CaseType.CRIMINAL and case.phase != CriminalPhase.EVIDENCE_EXAMINATION:
+        await db.update_case_phase(case_id, CriminalPhase.EVIDENCE_EXAMINATION)
 
     return (
         f"⚖️ 【{case.case_number}】証拠提出\n"
@@ -316,17 +378,20 @@ async def render_civil_verdict(case_id: int) -> str:
             f"/弁論 で口頭弁論、/証拠 で証拠を提出してください。"
         )
 
-    # Transition through FINAL_BRIEF before verdict
-    await db.update_case_phase(case_id, CivilPhase.FINAL_BRIEF)
-    await db.add_case_log(case_id, CivilPhase.FINAL_BRIEF, "JUDGE", "最終準備書面段階を経て判決に移行")
-
     logs = await db.get_case_logs(case_id)
     evidences = await db.get_evidence(case_id)
     precedents = await db.search_precedents(case.complaint_text[:50])
 
-    verdict_text, verdict_data = await ai_engine.judge_render_verdict(
-        case, _format_logs(logs), _format_evidence(evidences), _format_precedents(precedents)
-    )
+    try:
+        verdict_text, verdict_data = await ai_engine.judge_render_verdict(
+            case, _format_logs(logs), _format_evidence(evidences), _format_precedents(precedents)
+        )
+    except AIResponseError as e:
+        return f"❌ 【{case.case_number}】判決生成中にエラーが発生しました: {e}\n再度 /判決 をお試しください。"
+
+    # Transition through FINAL_BRIEF before verdict
+    await db.update_case_phase(case_id, CivilPhase.FINAL_BRIEF)
+    await db.add_case_log(case_id, CivilPhase.FINAL_BRIEF, "JUDGE", "最終準備書面段階を経て判決に移行")
 
     sentence = None
     summary = verdict_text[:100] if verdict_text else ""
@@ -383,14 +448,21 @@ async def file_criminal_complaint(
     )
     await db.add_case_log(case.id, CriminalPhase.COMPLAINT_FILED, accuser_id, complaint_text)
 
-    # Prosecutor investigates
-    await db.update_case_phase(case.id, CriminalPhase.INVESTIGATION)
+    # Prosecutor investigates — call AI first, then update phase
     case.phase = CriminalPhase.INVESTIGATION
-    investigation = await ai_engine.prosecutor_investigate(case)
+    try:
+        investigation = await ai_engine.prosecutor_investigate(case)
+    except AIResponseError as e:
+        return f"❌ 【{case.case_number}】捜査中にエラーが発生しました: {e}\n再度 /告訴 で提出してください。"
+
+    await db.update_case_phase(case.id, CriminalPhase.INVESTIGATION)
     await db.add_case_log(case.id, CriminalPhase.INVESTIGATION, "PROSECUTOR", investigation)
 
     # Clerk records
-    record = await ai_engine.clerk_create_record(case, "告訴受理・捜査開始", complaint_text)
+    try:
+        record = await ai_engine.clerk_create_record(case, "告訴受理・捜査開始", complaint_text)
+    except AIResponseError:
+        record = "（書記官記録の作成に失敗しました）"
     await db.add_case_log(case.id, CriminalPhase.INVESTIGATION, "CLERK", record)
 
     return (
@@ -421,12 +493,16 @@ async def decide_prosecution(case_id: int) -> str:
         if log["actor"] == "PROSECUTOR":
             investigation_log = log["content"]
 
-    await db.update_case_phase(case_id, CriminalPhase.PROSECUTION_DECISION)
     case.phase = CriminalPhase.PROSECUTION_DECISION
 
-    decision_text, is_prosecuted = await ai_engine.prosecutor_decide_charge(
-        case, investigation_log
-    )
+    try:
+        decision_text, is_prosecuted = await ai_engine.prosecutor_decide_charge(
+            case, investigation_log
+        )
+    except AIResponseError as e:
+        return f"❌ 【{case.case_number}】起訴判断中にエラーが発生しました: {e}\n再度 /起訴判断 をお試しください。"
+
+    await db.update_case_phase(case_id, CriminalPhase.PROSECUTION_DECISION)
     await db.add_case_log(case_id, CriminalPhase.PROSECUTION_DECISION, "PROSECUTOR", decision_text)
 
     if not is_prosecuted:
@@ -440,10 +516,14 @@ async def decide_prosecution(case_id: int) -> str:
             f"本事件は不起訴により終結しました。"
         )
 
-    # Prosecuted — notify rights
-    await db.update_case_phase(case_id, CriminalPhase.RIGHTS_NOTIFICATION)
+    # Prosecuted — notify rights (call AI first, then update phase)
     case.phase = CriminalPhase.RIGHTS_NOTIFICATION
-    rights = await ai_engine.defense_rights_notification(case)
+    try:
+        rights = await ai_engine.defense_rights_notification(case)
+    except AIResponseError:
+        rights = "（権利告知の生成に失敗しました。被告人には黙秘権等の権利があります。）"
+
+    await db.update_case_phase(case_id, CriminalPhase.RIGHTS_NOTIFICATION)
     await db.add_case_log(case_id, CriminalPhase.RIGHTS_NOTIFICATION, "DEFENSE", rights)
 
     return (
@@ -470,10 +550,14 @@ async def arraignment(case_id: int, defendant_id: str, plea: str) -> str:
     await db.update_case_phase(case_id, CriminalPhase.ARRAIGNMENT)
     await db.add_case_log(case_id, CriminalPhase.ARRAIGNMENT, defendant_id, f"罪状認否: {plea}")
 
-    # Opening procedure
-    await db.update_case_phase(case_id, CriminalPhase.OPENING_PROCEDURE)
+    # Opening procedure — call AI first, then update phase
     case.phase = CriminalPhase.OPENING_PROCEDURE
-    procedure = await ai_engine.opening_procedure(case)
+    try:
+        procedure = await ai_engine.opening_procedure(case)
+    except AIResponseError as e:
+        return f"❌ 【{case.case_number}】冒頭手続き生成中にエラーが発生しました: {e}\n罪状認否は記録されました。/次へ で再試行してください。"
+
+    await db.update_case_phase(case_id, CriminalPhase.OPENING_PROCEDURE)
     await db.add_case_log(case_id, CriminalPhase.OPENING_PROCEDURE, "JUDGE", procedure)
 
     return (
@@ -505,14 +589,21 @@ async def proceed_criminal_phase(case_id: int) -> str:
     current_phase = case.phase
 
     if current_phase == CriminalPhase.OPENING_PROCEDURE:
-        # → Opening statements
-        await db.update_case_phase(case_id, CriminalPhase.OPENING_STATEMENT)
+        # → Opening statements — call AI first, then update phase
         case.phase = CriminalPhase.OPENING_STATEMENT
 
-        prosecutor_opening = await ai_engine.prosecutor_opening(case)
-        await db.add_case_log(case_id, CriminalPhase.OPENING_STATEMENT, "PROSECUTOR", prosecutor_opening)
+        try:
+            prosecutor_opening = await ai_engine.prosecutor_opening(case)
+        except AIResponseError as e:
+            return f"❌ 【{case.case_number}】冒頭陳述生成中にエラーが発生しました: {e}\n再度 /次へ をお試しください。"
 
-        defense_open = await ai_engine.defense_opening(case)
+        try:
+            defense_open = await ai_engine.defense_opening(case)
+        except AIResponseError:
+            defense_open = "（弁護人冒頭陳述の生成に失敗しました）"
+
+        await db.update_case_phase(case_id, CriminalPhase.OPENING_STATEMENT)
+        await db.add_case_log(case_id, CriminalPhase.OPENING_STATEMENT, "PROSECUTOR", prosecutor_opening)
         await db.add_case_log(case_id, CriminalPhase.OPENING_STATEMENT, "DEFENSE", defense_open)
 
         return (
@@ -538,11 +629,15 @@ async def proceed_criminal_phase(case_id: int) -> str:
         )
 
     elif current_phase == CriminalPhase.EVIDENCE_EXAMINATION:
-        # → Defendant questioning
-        await db.update_case_phase(case_id, CriminalPhase.DEFENDANT_QUESTIONING)
+        # → Defendant questioning — call AI first
         case.phase = CriminalPhase.DEFENDANT_QUESTIONING
 
-        questions = await ai_engine.defendant_questioning_prompt(case, logs_text)
+        try:
+            questions = await ai_engine.defendant_questioning_prompt(case, logs_text)
+        except AIResponseError as e:
+            return f"❌ 【{case.case_number}】被告人質問生成中にエラーが発生しました: {e}\n再度 /次へ をお試しください。"
+
+        await db.update_case_phase(case_id, CriminalPhase.DEFENDANT_QUESTIONING)
         await db.add_case_log(case_id, CriminalPhase.DEFENDANT_QUESTIONING, "JUDGE", questions)
 
         return (
@@ -555,11 +650,15 @@ async def proceed_criminal_phase(case_id: int) -> str:
         )
 
     elif current_phase == CriminalPhase.DEFENDANT_QUESTIONING:
-        # → Prosecution closing
-        await db.update_case_phase(case_id, CriminalPhase.PROSECUTION_CLOSING)
+        # → Prosecution closing — call AI first
         case.phase = CriminalPhase.PROSECUTION_CLOSING
 
-        closing = await ai_engine.prosecutor_closing(case, logs_text, evidence_text)
+        try:
+            closing = await ai_engine.prosecutor_closing(case, logs_text, evidence_text)
+        except AIResponseError as e:
+            return f"❌ 【{case.case_number}】論告求刑生成中にエラーが発生しました: {e}\n再度 /次へ をお試しください。"
+
+        await db.update_case_phase(case_id, CriminalPhase.PROSECUTION_CLOSING)
         await db.add_case_log(case_id, CriminalPhase.PROSECUTION_CLOSING, "PROSECUTOR", closing)
 
         return (
@@ -571,11 +670,15 @@ async def proceed_criminal_phase(case_id: int) -> str:
         )
 
     elif current_phase == CriminalPhase.PROSECUTION_CLOSING:
-        # → Defense closing
-        await db.update_case_phase(case_id, CriminalPhase.DEFENSE_CLOSING)
+        # → Defense closing — call AI first
         case.phase = CriminalPhase.DEFENSE_CLOSING
 
-        defense_close = await ai_engine.defense_closing(case, logs_text, evidence_text)
+        try:
+            defense_close = await ai_engine.defense_closing(case, logs_text, evidence_text)
+        except AIResponseError as e:
+            return f"❌ 【{case.case_number}】最終弁論生成中にエラーが発生しました: {e}\n再度 /次へ をお試しください。"
+
+        await db.update_case_phase(case_id, CriminalPhase.DEFENSE_CLOSING)
         await db.add_case_log(case_id, CriminalPhase.DEFENSE_CLOSING, "DEFENSE", defense_close)
 
         return (
@@ -655,9 +758,12 @@ async def render_criminal_verdict(case_id: int) -> str:
     evidences = await db.get_evidence(case_id)
     precedents = await db.search_precedents(case.complaint_text[:50])
 
-    verdict_text, verdict_data = await ai_engine.judge_render_verdict(
-        case, _format_logs(logs), _format_evidence(evidences), _format_precedents(precedents)
-    )
+    try:
+        verdict_text, verdict_data = await ai_engine.judge_render_verdict(
+            case, _format_logs(logs), _format_evidence(evidences), _format_precedents(precedents)
+        )
+    except AIResponseError as e:
+        return f"❌ 【{case.case_number}】判決生成中にエラーが発生しました: {e}\n再度 /判決 をお試しください。"
 
     sentence = None
     summary = verdict_text[:100] if verdict_text else ""
@@ -740,11 +846,15 @@ async def file_appeal(case_id: int, appellant_id: str) -> str:
         parent_case_id=case.id,
     )
 
-    # Auto-review
-    await db.update_case_phase(new_case.id, CivilPhase.REVIEW if case.case_type == CaseType.CIVIL else CriminalPhase.INVESTIGATION)
+    # Auto-review — call AI first, then update phase
     new_case.phase = CivilPhase.REVIEW if case.case_type == CaseType.CIVIL else CriminalPhase.INVESTIGATION
 
-    review = await ai_engine.judge_review_complaint(new_case)
+    try:
+        review = await ai_engine.judge_review_complaint(new_case)
+    except AIResponseError:
+        review = "（受理審査の生成に失敗しました。手続きは進行可能です。）"
+
+    await db.update_case_phase(new_case.id, new_case.phase)
     await db.add_case_log(new_case.id, new_case.phase, "JUDGE", review)
 
     court_name = "高等裁判所" if next_level == CourtLevel.HIGH else "最高裁判所"

@@ -5,7 +5,9 @@ import hashlib
 import hmac
 import base64
 import logging
+import time
 from contextlib import asynccontextmanager
+from collections import OrderedDict
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -17,7 +19,7 @@ from config import (
 )
 import database as db
 from command_handler import handle_command
-from line_client import send_response
+from line_client import send_response, push_message
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,30 +74,105 @@ app = FastAPI(title="LINE AI司法システム", lifespan=lifespan)
 # Per-group event queues for ordering
 _group_queues: dict[str, asyncio.Queue] = {}
 _group_workers: dict[str, asyncio.Task] = {}
+_group_last_active: dict[str, float] = {}
+
+# Webhook deduplication (OrderedDict as LRU cache)
+_seen_events: OrderedDict[str, float] = OrderedDict()
+_SEEN_EVENTS_MAX = 1000
+_SEEN_EVENTS_TTL = 300  # 5 minutes
+
+# Reply token timeout threshold (seconds)
+_REPLY_TOKEN_TIMEOUT = 30
+
+
+def _is_duplicate_event(event: dict) -> bool:
+    """Check and record webhook event ID for deduplication."""
+    event_id = event.get("webhookEventId")
+    if not event_id:
+        return False
+
+    now = time.time()
+
+    # Clean expired entries
+    while _seen_events:
+        oldest_key, oldest_time = next(iter(_seen_events.items()))
+        if now - oldest_time > _SEEN_EVENTS_TTL:
+            _seen_events.pop(oldest_key)
+        else:
+            break
+
+    if event_id in _seen_events:
+        return True
+
+    _seen_events[event_id] = now
+    # Enforce max size
+    while len(_seen_events) > _SEEN_EVENTS_MAX:
+        _seen_events.popitem(last=False)
+
+    return False
 
 
 async def _group_worker(group_id: str):
     """Process events for a single group sequentially."""
     queue = _group_queues[group_id]
+    idle_timeout = 300  # 5 minutes
     while True:
-        event = await queue.get()
         try:
-            await process_event(event)
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=idle_timeout)
+            except asyncio.TimeoutError:
+                # Idle timeout — clean up this worker
+                break
+
+            _group_last_active[group_id] = time.time()
+            try:
+                await process_event(event)
+            except Exception as e:
+                logger.error(f"Group worker error for {group_id}: {e}", exc_info=True)
+            finally:
+                queue.task_done()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.error(f"Group worker error for {group_id}: {e}", exc_info=True)
-        finally:
-            queue.task_done()
+            # Unexpected error in worker loop — log and continue
+            logger.error(f"Group worker unexpected error for {group_id}: {e}", exc_info=True)
+            await asyncio.sleep(1)
+
+    # Cleanup on idle timeout
+    _group_queues.pop(group_id, None)
+    _group_workers.pop(group_id, None)
+    _group_last_active.pop(group_id, None)
+    logger.debug(f"Group worker for {group_id} cleaned up due to idle timeout")
+
+
+def _ensure_worker(group_id: str):
+    """Ensure a worker exists for the group, restarting if crashed."""
+    existing = _group_workers.get(group_id)
+    if existing and not existing.done():
+        return
+
+    if existing and existing.done():
+        logger.warning(f"Restarting crashed worker for group {group_id}")
+
+    if group_id not in _group_queues:
+        _group_queues[group_id] = asyncio.Queue()
+
+    _group_workers[group_id] = asyncio.create_task(_group_worker(group_id))
 
 
 def enqueue_event(event: dict):
     """Enqueue an event for sequential processing per group."""
+    if _is_duplicate_event(event):
+        logger.info(f"Duplicate webhook event skipped: {event.get('webhookEventId')}")
+        return
+
+    # Attach enqueue timestamp for reply token optimization
+    event["_enqueued_at"] = time.time()
+
     source = event.get("source", {})
     group_id = source.get("groupId", source.get("userId", "unknown"))
 
-    if group_id not in _group_queues:
-        _group_queues[group_id] = asyncio.Queue()
-        _group_workers[group_id] = asyncio.create_task(_group_worker(group_id))
-
+    _ensure_worker(group_id)
     _group_queues[group_id].put_nowait(event)
 
 
@@ -142,6 +219,19 @@ async def callback(request: Request):
     return {"status": "ok"}
 
 
+async def _send_with_token_check(event: dict, reply_token: str, to: str, text: str):
+    """Send response, using push directly if reply token is likely expired."""
+    enqueued_at = event.get("_enqueued_at", 0)
+    elapsed = time.time() - enqueued_at if enqueued_at else 0
+
+    if elapsed > _REPLY_TOKEN_TIMEOUT:
+        # Token likely expired — skip reply attempt, use push directly
+        logger.info(f"Reply token likely expired ({elapsed:.1f}s), using push")
+        await push_message(to, text)
+    else:
+        await send_response(reply_token, to, text)
+
+
 async def process_event(event: dict):
     """Process a single LINE webhook event."""
     try:
@@ -168,8 +258,8 @@ async def process_event(event: dict):
         elif source_type == "user":
             # 1:1 chat — respond with help
             user_id = source.get("userId", "")
-            await send_response(
-                reply_token, user_id,
+            await _send_with_token_check(
+                event, reply_token, user_id,
                 "⚖️ AI司法システムはグループチャットでのみ使用できます。\n"
                 "グループにBotを招待してご利用ください。"
             )
@@ -185,7 +275,7 @@ async def process_event(event: dict):
         response = await handle_command(event, group_id, user_id, reply_token)
 
         if response:
-            await send_response(reply_token, group_id, response)
+            await _send_with_token_check(event, reply_token, group_id, response)
 
     except Exception as e:
         logger.error(f"Event processing error: {e}", exc_info=True)
@@ -195,8 +285,8 @@ async def process_event(event: dict):
             source = event.get("source", {})
             to = source.get("groupId") or source.get("userId", "")
             if to:
-                await send_response(
-                    reply_token, to,
+                await _send_with_token_check(
+                    event, reply_token, to,
                     "❌ システムエラーが発生しました。しばらく待ってから再度お試しください。"
                 )
         except Exception:

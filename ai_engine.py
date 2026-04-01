@@ -8,6 +8,13 @@ from typing import Optional
 
 from config import ANTHROPIC_API_KEY, CLAUDE_MODEL
 from models import CaseRecord
+
+
+class AIResponseError(Exception):
+    """Raised when Claude API call fails (timeout, HTTP error, etc.)."""
+    pass
+
+
 from ai_personas import (
     get_judge_review_prompt,
     get_judge_issue_organization_prompt,
@@ -59,40 +66,52 @@ async def call_claude(system_prompt: str, user_message: str, max_tokens: int = 4
             return "\n".join(text_parts)
         except httpx.TimeoutException:
             logger.error("Claude API timeout")
-            return "【システムエラー】AI応答がタイムアウトしました。しばらく待ってから再度お試しください。"
+            raise AIResponseError("AI応答がタイムアウトしました。しばらく待ってから再度お試しください。")
         except httpx.HTTPStatusError as e:
             logger.error(f"Claude API HTTP error: {e.response.status_code} {e.response.text}")
-            return f"【システムエラー】AI APIエラーが発生しました（{e.response.status_code}）。"
+            raise AIResponseError(f"AI APIエラーが発生しました（{e.response.status_code}）。")
+        except AIResponseError:
+            raise
         except Exception as e:
             logger.error(f"Claude API error: {e}")
-            return "【システムエラー】AI応答の取得に失敗しました。"
+            raise AIResponseError("AI応答の取得に失敗しました。")
+
+
+def _extract_json_by_brace_counting(text: str, start: int) -> Optional[dict]:
+    """Extract a JSON object starting at the given position using brace counting."""
+    brace_count = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            brace_count += 1
+        elif text[i] == "}":
+            brace_count -= 1
+            if brace_count == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
 
 
 def _extract_json_from_text(text: str, key_hint: str) -> Optional[dict]:
     """Extract a JSON object from AI response text, looking for a specific key."""
-    # Try to find JSON in ```json ... ``` blocks
-    json_match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(1))
-        except json.JSONDecodeError:
-            pass
+    # Try to find JSON in ```json ... ``` blocks (use brace counting for nested objects)
+    block_match = re.search(r"```json\s*", text)
+    if block_match:
+        # Find the opening brace after ```json
+        rest = text[block_match.end():]
+        brace_start = rest.find("{")
+        if brace_start != -1:
+            result = _extract_json_by_brace_counting(rest, brace_start)
+            if result is not None:
+                return result
 
     # Try to find raw JSON object by key hint
     json_match = re.search(rf'\{{\s*"{key_hint}"\s*:', text, re.DOTALL)
     if json_match:
-        start = json_match.start()
-        brace_count = 0
-        for i in range(start, len(text)):
-            if text[i] == "{":
-                brace_count += 1
-            elif text[i] == "}":
-                brace_count -= 1
-                if brace_count == 0:
-                    try:
-                        return json.loads(text[start:i + 1])
-                    except json.JSONDecodeError:
-                        break
+        result = _extract_json_by_brace_counting(text, json_match.start())
+        if result is not None:
+            return result
 
     return None
 
@@ -168,9 +187,13 @@ async def prosecutor_decide_charge(case: CaseRecord, investigation: str) -> tupl
         is_prosecuted = decision_data["decision"] == "PROSECUTE"
         return response, is_prosecuted
 
-    # Fallback: text-based detection
+    # Fallback: text-based detection — check for NOT_PROSECUTE keywords first
     logger.warning("Prosecution decision JSON not found, falling back to text detection")
-    is_prosecuted = "起訴" in response and "不起訴" not in response.split("起訴")[-1][:20]
+    not_prosecute_keywords = ["不起訴", "起訴猶予", "起訴しない", "嫌疑不十分", "嫌疑なし"]
+    if any(kw in response for kw in not_prosecute_keywords):
+        is_prosecuted = False
+    else:
+        is_prosecuted = "起訴" in response
     return response, is_prosecuted
 
 

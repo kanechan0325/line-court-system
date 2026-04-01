@@ -90,8 +90,21 @@ async def create_tables():
                 phase TEXT NOT NULL,
                 actor TEXT NOT NULL,
                 content TEXT NOT NULL,
+                action_type TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
             )
+        """)
+        # Add action_type column if table already exists without it
+        await conn.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'case_logs' AND column_name = 'action_type'
+                ) THEN
+                    ALTER TABLE case_logs ADD COLUMN action_type TEXT;
+                END IF;
+            END $$;
         """)
     logger.info("Database tables created/verified")
 
@@ -317,16 +330,19 @@ async def get_all_precedents() -> list[PrecedentRecord]:
 
 # --- Case Logs ---
 
-async def add_case_log(case_id: int, phase: str, actor: str, content: str):
+async def add_case_log(
+    case_id: int, phase: str, actor: str, content: str,
+    action_type: Optional[str] = None,
+):
     """Add a log entry for a case."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO case_logs (case_id, phase, actor, content)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO case_logs (case_id, phase, actor, content, action_type)
+            VALUES ($1, $2, $3, $4, $5)
             """,
-            case_id, phase, actor, content,
+            case_id, phase, actor, content, action_type,
         )
 
 

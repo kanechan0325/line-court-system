@@ -3,18 +3,29 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _require_env(key: str) -> str:
+    """Get a required environment variable or raise ValueError."""
+    value = os.getenv(key, "").strip()
+    if not value:
+        raise ValueError(
+            f"必須環境変数 {key} が設定されていません。.env ファイルまたは環境変数を確認してください。"
+        )
+    return value
+
+
 # LINE Messaging API
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = _require_env("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = _require_env("LINE_CHANNEL_SECRET")
 
 # Claude API
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY = _require_env("ANTHROPIC_API_KEY")
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 
 # Database
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+DATABASE_URL = _require_env("DATABASE_URL")
 
-# Render
+# Render (optional)
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
 # Constants
