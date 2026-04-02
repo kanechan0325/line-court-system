@@ -19,6 +19,7 @@ class CourtLevel(str, Enum):
 class CivilPhase(str, Enum):
     COMPLAINT_FILED = "COMPLAINT_FILED"
     REVIEW = "REVIEW"
+    DISMISSED = "DISMISSED"              # 却下（受理審査で不受理）
     CASE_NUMBERED = "CASE_NUMBERED"
     ANSWER_SUBMITTED = "ANSWER_SUBMITTED"
     ISSUE_ORGANIZATION = "ISSUE_ORGANIZATION"
@@ -54,6 +55,7 @@ class CriminalPhase(str, Enum):
 class CaseStatus(str, Enum):
     ACTIVE = "ACTIVE"
     CLOSED = "CLOSED"
+    DISMISSED = "DISMISSED"                # 却下
     APPEALED = "APPEALED"
     SETTLED = "SETTLED"
     JOKOKU_APPEALED = "JOKOKU_APPEALED"  # 上告済

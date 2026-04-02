@@ -17,6 +17,23 @@ from ai_engine import AIResponseError
 
 logger = logging.getLogger(__name__)
 
+# Keywords that indicate the judge dismissed/rejected the complaint
+_DISMISS_KEYWORDS = ("却下", "不受理")
+_ACCEPT_KEYWORDS = ("受理",)
+
+
+def _is_dismissed(review_text: str) -> bool:
+    """Check if the judge's review indicates dismissal.
+
+    Counts accept vs dismiss keyword occurrences.
+    '受理' alone means accepted; '却下' or '不受理' means dismissed.
+    Since '不受理' contains '受理', we check dismiss keywords first.
+    """
+    text = review_text.replace("不受理", "＿不受理＿")  # protect compound word
+    dismiss_count = sum(text.count(kw) for kw in ("＿不受理＿", "却下"))
+    accept_count = text.count("受理")
+    return dismiss_count > 0 and dismiss_count >= accept_count
+
 
 def _format_appeal_deadline(deadline: Optional[datetime]) -> str:
     """Format appeal deadline for display in JST."""
@@ -93,6 +110,20 @@ async def file_civil_complaint(
 
     await db.update_case_phase(case.id, CivilPhase.REVIEW)
     await db.add_case_log(case.id, CivilPhase.REVIEW, "JUDGE", review)
+
+    # Check if judge dismissed the complaint
+    if _is_dismissed(review):
+        await db.update_case_phase(case.id, CivilPhase.DISMISSED)
+        await db.update_case_status(case.id, CaseStatus.DISMISSED)
+        await db.add_case_log(case.id, CivilPhase.DISMISSED, "JUDGE", "訴状却下")
+        return (
+            f"⚖️ 【民事事件却下】\n"
+            f"事件番号: {case.case_number}\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"📋 【受理審査結果】\n{review}\n\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"訴状は却下されました。内容を修正して再度 /訴状 で提出できます。"
+        )
 
     # Clerk creates record — call AI first, then update phase
     try:
