@@ -30,6 +30,11 @@ from ai_personas import (
     get_judge_prompt,
     get_prosecutor_prompt,
     get_defense_prompt,
+    get_prosecutor_summary_request_prompt,
+    get_judge_summary_order_prompt,
+    get_judge_jokoku_review_prompt,
+    get_judge_retrial_review_prompt,
+    get_judge_kokoku_review_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -206,17 +211,24 @@ async def prosecutor_investigate(case: CaseRecord) -> str:
     return await call_claude(system, user_msg)
 
 
-async def prosecutor_decide_charge(case: CaseRecord, investigation: str) -> tuple[str, bool]:
-    """Prosecutor decides whether to prosecute. Returns (response, is_prosecuted)."""
+async def prosecutor_decide_charge(case: CaseRecord, investigation: str) -> tuple[str, bool, str]:
+    """Prosecutor decides whether to prosecute.
+
+    Returns (response, is_prosecuted, procedure).
+    procedure is "SUMMARY" or "FORMAL".
+    """
     system = get_prosecutor_charge_decision_prompt(case, investigation)
     user_msg = "捜査結果に基づき、起訴/不起訴の判断を行ってください。"
     response = await call_claude(system, user_msg)
+
+    procedure = "FORMAL"
 
     # Try JSON-based detection first
     decision_data = parse_prosecution_json(response)
     if decision_data and "decision" in decision_data:
         is_prosecuted = decision_data["decision"] == "PROSECUTE"
-        return response, is_prosecuted
+        procedure = decision_data.get("procedure", "FORMAL")
+        return response, is_prosecuted, procedure
 
     # Fallback: text-based detection — check for NOT_PROSECUTE keywords first
     logger.warning("Prosecution decision JSON not found, falling back to text detection")
@@ -225,7 +237,10 @@ async def prosecutor_decide_charge(case: CaseRecord, investigation: str) -> tupl
         is_prosecuted = False
     else:
         is_prosecuted = "起訴" in response
-    return response, is_prosecuted
+    # Check for summary procedure in text fallback
+    if "略式" in response:
+        procedure = "SUMMARY"
+    return response, is_prosecuted, procedure
 
 
 async def prosecutor_opening(case: CaseRecord) -> str:
@@ -322,3 +337,61 @@ async def defendant_questioning_prompt(case: CaseRecord, logs: str) -> str:
 
 ※被告人の回答は次のステップで受け付けます。"""
     return await call_claude(system, user_msg)
+
+
+# --- Summary Trial functions ---
+
+async def judge_render_summary_order(case: CaseRecord, logs: str) -> tuple[str, Optional[dict]]:
+    """Judge renders a summary order (略式命令). Returns (full_text, parsed_json_or_none)."""
+    system = get_judge_summary_order_prompt(case, logs)
+    user_msg = "書面審理に基づき略式命令を発してください。"
+    response = await call_claude(system, user_msg)
+    verdict_data = parse_verdict_json(response)
+    return response, verdict_data
+
+
+async def prosecutor_summary_request(case: CaseRecord, investigation: str) -> tuple[str, Optional[dict]]:
+    """Prosecutor requests summary prosecution. Returns (response, parsed_json_or_none)."""
+    system = get_prosecutor_summary_request_prompt(case, investigation)
+    user_msg = "略式命令の請求を検討してください。"
+    response = await call_claude(system, user_msg)
+    data = _extract_json_from_text(response, "summary_eligible")
+    return response, data
+
+
+# --- Jokoku Appeal functions ---
+
+async def judge_review_jokoku(case: CaseRecord, original_verdict: str, jokoku_reason: str) -> str:
+    """Judge reviews a jokoku appeal (上告審受理審査)."""
+    system = get_judge_jokoku_review_prompt(case, original_verdict, jokoku_reason)
+    user_msg = f"上告理由:\n{jokoku_reason}\n\n上告審受理審査を行ってください。"
+    return await call_claude(system, user_msg)
+
+
+# --- Retrial functions ---
+
+def parse_review_decision_json(text: str) -> Optional[dict]:
+    """Parse retrial/kokoku review decision JSON. Expects {"decision": "ACCEPT"|"REJECT", ...}."""
+    return _extract_json_from_text(text, "decision")
+
+
+async def judge_review_retrial(case: CaseRecord, retrial_reason: str) -> tuple[str, bool]:
+    """Judge reviews a retrial request. Returns (response, is_accepted)."""
+    system = get_judge_retrial_review_prompt(case, retrial_reason)
+    user_msg = f"再審請求理由:\n{retrial_reason}\n\n再審事由の審査を行ってください。"
+    response = await call_claude(system, user_msg)
+    data = parse_review_decision_json(response)
+    is_accepted = data is not None and data.get("decision") == "ACCEPT"
+    return response, is_accepted
+
+
+# --- Kokoku Appeal functions ---
+
+async def judge_review_kokoku(case: CaseRecord, kokoku_reason: str) -> tuple[str, bool]:
+    """Judge reviews a kokoku appeal. Returns (response, is_accepted)."""
+    system = get_judge_kokoku_review_prompt(case, kokoku_reason)
+    user_msg = f"抗告理由:\n{kokoku_reason}\n\n抗告の審査を行ってください。"
+    response = await call_claude(system, user_msg)
+    data = parse_review_decision_json(response)
+    is_accepted = data is not None and data.get("decision") == "ACCEPT"
+    return response, is_accepted

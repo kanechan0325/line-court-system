@@ -10,6 +10,7 @@ class CaseType(str, Enum):
 
 
 class CourtLevel(str, Enum):
+    SUMMARY = "SUMMARY"    # 簡易裁判所（略式事件）
     DISTRICT = "DISTRICT"
     HIGH = "HIGH"
     SUPREME = "SUPREME"
@@ -43,6 +44,9 @@ class CriminalPhase(str, Enum):
     PROSECUTION_CLOSING = "PROSECUTION_CLOSING"
     DEFENSE_CLOSING = "DEFENSE_CLOSING"
     FINAL_STATEMENT = "FINAL_STATEMENT"
+    SUMMARY_CONSENT = "SUMMARY_CONSENT"       # 略式手続同意確認
+    SUMMARY_ORDER = "SUMMARY_ORDER"           # 略式命令
+    SUMMARY_OBJECTION = "SUMMARY_OBJECTION"   # 正式裁判請求済
     VERDICT = "VERDICT"
     CLOSED = "CLOSED"
 
@@ -52,6 +56,9 @@ class CaseStatus(str, Enum):
     CLOSED = "CLOSED"
     APPEALED = "APPEALED"
     SETTLED = "SETTLED"
+    JOKOKU_APPEALED = "JOKOKU_APPEALED"  # 上告済
+    RETRIAL = "RETRIAL"                    # 再審中
+    KOKOKU_APPEALED = "KOKOKU_APPEALED"    # 抗告済
 
 
 class Verdict(str, Enum):
@@ -62,6 +69,7 @@ class Verdict(str, Enum):
     PARTIAL = "PARTIAL"
     DISMISSED = "DISMISSED"
     SETTLED = "SETTLED"
+    SUMMARY_FINE = "SUMMARY_FINE"  # 略式命令（罰金・科料）
 
 
 # Phase transition orders
@@ -104,6 +112,7 @@ CASE_NUMBER_SYMBOLS = {
         CourtLevel.SUPREME: "オ",
     },
     CaseType.CRIMINAL: {
+        CourtLevel.SUMMARY: "い",
         CourtLevel.DISTRICT: "わ",
         CourtLevel.HIGH: "う",
         CourtLevel.SUPREME: "あ",
@@ -111,9 +120,11 @@ CASE_NUMBER_SYMBOLS = {
 }
 
 
-def generate_case_number(case_type: CaseType, court_level: CourtLevel, seq: int) -> str:
+def generate_case_number(case_type: CaseType, court_level: CourtLevel, seq: int, is_retrial: bool = False) -> str:
     """Generate a case number like R8-(ワ)-001"""
     symbol = CASE_NUMBER_SYMBOLS[case_type][court_level]
+    if is_retrial:
+        symbol += "再"
     return f"R8-({symbol})-{seq:03d}"
 
 
@@ -131,7 +142,10 @@ PHASE_DISPLAY_NAMES = {
     "FINAL_BRIEF": "最終準備書面",
     "VERDICT": "判決",
     "CLOSED": "終結",
-    # Criminal phases
+    # Criminal phases (including summary trial)
+    "SUMMARY_CONSENT": "略式手続同意確認",
+    "SUMMARY_ORDER": "略式命令",
+    "SUMMARY_OBJECTION": "正式裁判請求",
     "INVESTIGATION": "捜査",
     "PROSECUTION_DECISION": "起訴判断",
     "NOT_PROSECUTED": "不起訴",
@@ -170,6 +184,7 @@ class CaseRecord:
     appeal_deadline: Optional[datetime] = None
     parent_case_id: Optional[int] = None
     status: str = "ACTIVE"
+    case_subtype: Optional[str] = None  # "SUMMARY", "JOKOKU", "RETRIAL", "KOKOKU"
 
 
 @dataclass

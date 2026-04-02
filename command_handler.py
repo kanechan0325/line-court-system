@@ -6,13 +6,13 @@ from typing import Optional
 
 import database as db
 import case_manager
-from models import CaseType, CivilPhase, CriminalPhase, get_phase_display
+from models import CaseType, CourtLevel, CivilPhase, CriminalPhase, get_phase_display
 from line_client import resolve_mention
 
 logger = logging.getLogger(__name__)
 
 # Case number pattern: R8-(ワ)-001 etc.
-CASE_NUMBER_PATTERN = re.compile(r"R8-\([ワネオわうあ]\)-\d{3}")
+CASE_NUMBER_PATTERN = re.compile(r"R8-\([ワネオわうあい][再]?\)-\d{3}")
 
 
 def parse_command(text: str) -> tuple[str, str]:
@@ -115,6 +115,20 @@ async def handle_command(
             return await handle_verdict(group_id, args)
         elif command == "/控訴":
             return await handle_appeal(group_id, user_id, args)
+        elif command == "/略式起訴":
+            return await handle_summary_prosecution(group_id, user_id, args)
+        elif command == "/略式同意":
+            return await handle_summary_consent(group_id, user_id, args)
+        elif command == "/略式拒否":
+            return await handle_summary_reject(group_id, user_id, args)
+        elif command == "/正式裁判":
+            return await handle_formal_trial_request(group_id, user_id, args)
+        elif command == "/上告":
+            return await handle_jokoku_appeal(group_id, user_id, args)
+        elif command == "/再審":
+            return await handle_retrial(group_id, user_id, args)
+        elif command == "/抗告":
+            return await handle_kokoku(group_id, user_id, args)
         elif command == "/事件一覧":
             return await handle_case_list(group_id)
         elif command == "/事件詳細":
@@ -385,6 +399,82 @@ async def handle_precedent_search(args: str) -> str:
     return await case_manager.search_precedents_cmd(args)
 
 
+async def handle_summary_prosecution(group_id: str, user_id: str, args: str) -> str:
+    """Handle /略式起訴"""
+    case, _, error = await resolve_case(group_id, args)
+    if error:
+        return error
+    party_error = check_party(case, user_id)
+    if party_error:
+        return party_error
+    return await case_manager.request_summary_prosecution(case.id)
+
+
+async def handle_summary_consent(group_id: str, user_id: str, args: str) -> str:
+    """Handle /略式同意"""
+    case, _, error = await resolve_case(group_id, args)
+    if error:
+        return error
+    return await case_manager.consent_summary(case.id, user_id)
+
+
+async def handle_summary_reject(group_id: str, user_id: str, args: str) -> str:
+    """Handle /略式拒否"""
+    case, _, error = await resolve_case(group_id, args)
+    if error:
+        return error
+    return await case_manager.reject_summary(case.id, user_id)
+
+
+async def handle_formal_trial_request(group_id: str, user_id: str, args: str) -> str:
+    """Handle /正式裁判"""
+    case, _, error = await resolve_case(group_id, args)
+    if error:
+        return error
+    party_error = check_party(case, user_id)
+    if party_error:
+        return party_error
+    return await case_manager.request_formal_trial(case.id, user_id)
+
+
+async def handle_jokoku_appeal(group_id: str, user_id: str, args: str) -> str:
+    """Handle /上告 [事件番号] 上告理由"""
+    case_number, remaining = extract_case_number(args)
+    if case_number:
+        case = await db.get_case_by_number(case_number)
+        if not case:
+            return f"❌ 事件番号 {case_number} が見つかりません。"
+    else:
+        # Look for cases with verdict at HIGH court
+        cases = await db.get_active_cases(group_id)
+        case = None
+        for c in cases:
+            if c.phase in (CivilPhase.VERDICT, CriminalPhase.VERDICT) and c.court_level == CourtLevel.HIGH:
+                case = c
+                break
+        if not case:
+            return "❌ 上告可能な高裁判決がありません。"
+        remaining = args
+
+    return await case_manager.file_jokoku_appeal(case.id, user_id, remaining)
+
+
+async def handle_retrial(group_id: str, user_id: str, args: str) -> str:
+    """Handle /再審 事件番号 再審事由"""
+    case_number, remaining = extract_case_number(args)
+    if not case_number:
+        return "❌ 再審請求には事件番号が必要です。\n使い方: /再審 R8-(わ)-001 再審事由"
+    return await case_manager.file_retrial(case_number, group_id, user_id, remaining)
+
+
+async def handle_kokoku(group_id: str, user_id: str, args: str) -> str:
+    """Handle /抗告 事件番号 抗告理由"""
+    case_number, remaining = extract_case_number(args)
+    if not case_number:
+        return "❌ 抗告には事件番号が必要です。\n使い方: /抗告 R8-(ワ)-001 抗告理由"
+    return await case_manager.file_kokoku(case_number, group_id, user_id, remaining)
+
+
 def handle_help() -> str:
     """Return help text."""
     return (
@@ -402,17 +492,28 @@ def handle_help() -> str:
         "  /罪状認否 認める|否認 — 罪状認否（被告人のみ）\n"
         "  /次へ — 次のフェーズに進む\n"
         "  /最終陳述 内容 — 被告人最終陳述（被告人のみ）\n\n"
+        "🔍 【略式手続（刑事）】\n"
+        "  /略式起訴 — 略式命令を請求（罰金相当事件）\n"
+        "  /略式同意 — 略式手続に同意（被疑者のみ）\n"
+        "  /略式拒否 — 略式手続を拒否（被疑者のみ）\n"
+        "  /正式裁判 — 略式命令後に正式裁判を請求\n\n"
         "📢 【共通】\n"
         "  /弁論 内容 — 口頭弁論・主張（当事者のみ）\n"
         "  /証拠 内容 — 証拠を提出（当事者のみ）\n"
-        "  /判決 — 判決を求める\n"
-        "  /控訴 — 控訴する（当事者のみ）\n"
+        "  /判決 — 判決を求める\n\n"
+        "📢 【不服申立】\n"
+        "  /控訴 — 地裁判決に控訴（→高裁）\n"
+        "  /上告 [理由] — 高裁判決に上告（→最高裁）\n"
+        "  /再審 [事件番号] 理由 — 確定判決の再審請求\n"
+        "  /抗告 [事件番号] 理由 — 和解決定への不服申立\n\n"
+        "📢 【情報】\n"
         "  /事件一覧 — 進行中の事件一覧\n"
         "  /事件詳細 [番号] — 事件の詳細\n"
         "  /判例 [キーワード] — 判例を検索\n"
         "  /ヘルプ — このメッセージ\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "📌 三審制: 地裁→高裁→最高裁\n"
-        "📌 控訴期限: 判決から14日以内\n"
+        "📌 控訴/上告期限: 判決から14日以内\n"
+        "📌 略式手続: 罰金・科料相当の軽微事件に利用可能\n"
         "📌 複数事件がある場合は事件番号を指定してください"
     )

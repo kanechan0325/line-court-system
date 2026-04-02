@@ -109,6 +109,18 @@ async def create_tables():
                 END IF;
             END $$;
         """)
+        # Add case_subtype column if table already exists without it
+        await conn.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'cases' AND column_name = 'case_subtype'
+                ) THEN
+                    ALTER TABLE cases ADD COLUMN case_subtype TEXT;
+                END IF;
+            END $$;
+        """)
         # Create indexes for performance
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_group_id ON cases(group_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_type_level ON cases(case_type, court_level)")
@@ -130,6 +142,8 @@ async def create_case(
     group_id: str,
     complaint_text: str,
     parent_case_id: Optional[int] = None,
+    case_subtype: Optional[str] = None,
+    is_retrial: bool = False,
 ) -> CaseRecord:
     """Create a new case with atomic case number generation."""
     pool = await get_pool()
@@ -145,7 +159,8 @@ async def create_case(
                 )
                 seq = row["seq"]
                 case_number = generate_case_number(
-                    CaseType(case_type), CourtLevel(court_level), seq
+                    CaseType(case_type), CourtLevel(court_level), seq,
+                    is_retrial=is_retrial,
                 )
                 try:
                     result = await conn.fetchrow(
@@ -153,13 +168,13 @@ async def create_case(
                         INSERT INTO cases (
                             case_number, case_type, court_level, phase,
                             plaintiff_id, defendant_id, group_id, complaint_text,
-                            parent_case_id, status
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ACTIVE')
+                            parent_case_id, status, case_subtype
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ACTIVE', $10)
                         RETURNING *
                         """,
                         case_number, case_type, court_level, phase,
                         plaintiff_id, defendant_id, group_id, complaint_text,
-                        parent_case_id,
+                        parent_case_id, case_subtype,
                     )
                     return _row_to_case(result)
                 except Exception as e:
@@ -256,6 +271,27 @@ async def update_case_status(case_id: int, status: str):
             "UPDATE cases SET status = $1, updated_at = NOW() WHERE id = $2",
             status, case_id,
         )
+
+
+async def update_case_court_level(case_id: int, court_level: str):
+    """Update the court level of a case."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE cases SET court_level = $1, updated_at = NOW() WHERE id = $2",
+            court_level, case_id,
+        )
+
+
+async def get_closed_cases(group_id: str) -> list[CaseRecord]:
+    """Get all closed/settled cases for a group (for retrial/kokoku candidates)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM cases WHERE group_id = $1 AND status IN ('CLOSED', 'SETTLED') ORDER BY created_at DESC",
+            group_id,
+        )
+    return [_row_to_case(row) for row in rows]
 
 
 # --- Evidence CRUD ---
@@ -388,6 +424,7 @@ def _row_to_case(row) -> CaseRecord:
         appeal_deadline=row["appeal_deadline"],
         parent_case_id=row["parent_case_id"],
         status=row["status"],
+        case_subtype=row.get("case_subtype"),
     )
 
 
