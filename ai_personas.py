@@ -1,19 +1,45 @@
 """AI persona system prompts for the 4 judicial roles."""
 
+import re
+
 from models import CaseRecord, CourtLevel, CaseType
+
+# Maximum length for user-provided text in prompts (prevent token explosion)
+_MAX_USER_TEXT_LENGTH = 10000
+
+
+def _sanitize_user_text(text: str) -> str:
+    """Sanitize user-provided text before including in AI prompts.
+
+    Prevents prompt injection by:
+    - Truncating excessively long text
+    - Removing markdown code block markers that could confuse JSON extraction
+    - Removing lines that look like system/instruction overrides
+    """
+    if not text:
+        return text
+    # Truncate to prevent token explosion
+    if len(text) > _MAX_USER_TEXT_LENGTH:
+        text = text[:_MAX_USER_TEXT_LENGTH] + "…（以下省略）"
+    # Remove code block markers to prevent JSON extraction confusion
+    text = text.replace("```json", "").replace("```", "")
+    # Remove lines that look like system instruction overrides
+    text = re.sub(r'^\s*\[?(SYSTEM|INSTRUCTION|OVERRIDE|指示|命令)\]?\s*[:：].*$', '', text, flags=re.MULTILINE | re.IGNORECASE)
+    return text
 
 
 def _format_case_context(case: CaseRecord) -> str:
     """Format case information for inclusion in prompts."""
+    complaint = _sanitize_user_text(case.complaint_text)
     ctx = f"""【事件情報】
 事件番号: {case.case_number}
 事件種別: {'民事' if case.case_type == 'CIVIL' else '刑事'}
 審級: {_court_level_ja(case.court_level)}
 現在のフェーズ: {case.phase}
-訴状/告訴内容: {case.complaint_text}"""
+訴状/告訴内容: {complaint}"""
 
     if case.answer_text:
-        ctx += f"\n答弁内容: {case.answer_text}"
+        ctx += f"\n答弁内容: {_sanitize_user_text(case.answer_text)}"
     return ctx
 
 
@@ -111,7 +137,7 @@ def get_judge_issue_organization_prompt(case: CaseRecord, logs: str) -> str:
 {_format_case_context(case)}
 
 【これまでの経緯】
-{logs}
+{_sanitize_user_text(logs)}
 
 【指示】
 1. 双方の主張を要約する
@@ -127,11 +153,17 @@ def get_judge_settlement_prompt(case: CaseRecord, logs: str) -> str:
 {_format_case_context(case)}
 
 【これまでの経緯】
-{logs}
+{_sanitize_user_text(logs)}
 
 【指示】
 双方の主張を踏まえ、具体的な和解案を提示してください。
-和解案は双方にとって受け入れ可能な妥協点を示してください。"""
+和解案は双方にとって受け入れ可能な妥協点を示してください。
+
+【和解案の基準】
+- 和解は双方の自由意思に基づく合意であること（民事訴訟法89条）
+- 一方に著しく不利な内容でないこと（公正性）
+- 金銭的解決の場合は具体的な金額・支払方法を明示すること
+- 履行期限を設定すること"""
 
 
 def get_judge_verdict_prompt(case: CaseRecord, logs: str, evidence: str, precedents: str) -> str:
@@ -142,10 +174,10 @@ def get_judge_verdict_prompt(case: CaseRecord, logs: str, evidence: str, precede
 {_format_case_context(case)}
 
 【審理記録】
-{logs}
+{_sanitize_user_text(logs)}
 
 【証拠一覧】
-{evidence if evidence else "提出された証拠なし"}
+{_sanitize_user_text(evidence) if evidence else "提出された証拠なし"}
 
 【関連判例】
 {precedents if precedents else "関連判例なし"}
@@ -159,11 +191,11 @@ def get_judge_verdict_prompt(case: CaseRecord, logs: str, evidence: str, precede
 4. {"量刑を決定する（日本の法定刑に基づく）" if case.case_type == "CRIMINAL" else "請求の認容・棄却を決定する"}
 5. 判決主文を述べる
 
-必ず以下のJSON形式を判決文の最後に含めてください：
+必ず以下のJSON形式を判決文の最後に含めてください（全フィールド必須）：
 ```json
 {{
     "verdict": "{"GUILTY/NOT_GUILTY" if case.case_type == "CRIMINAL" else "PLAINTIFF_WINS/DEFENDANT_WINS/PARTIAL/DISMISSED"}",
-    "sentence": "量刑または命令内容",
+    "sentence": "{"量刑（例: 懲役2年、罰金30万円）" if case.case_type == "CRIMINAL" else "命令内容（例: 損害賠償100万円の支払い）"}",
     "summary": "判決要旨（100文字以内）"
 }}
 ```"""
@@ -217,6 +249,8 @@ def get_prosecutor_charge_decision_prompt(case: CaseRecord, investigation: str) 
 - 略式手続が適切か（100万円以下の罰金・科料に相当する軽微な事件の場合）
 
 起訴する場合は適用罪名と法定刑を明示してください。
+（参考: 窃盗罪=10年以下懲役/50万円以下罰金、暴行罪=2年以下懲役/30万円以下罰金、
+傷害罪=15年以下懲役/50万円以下罰金、詐欺罪=10年以下懲役、名誉毀損罪=3年以下懲役/50万円以下罰金）
 不起訴の場合はその理由を明示してください。
 略式手続が適切な場合（罰金・科料相当の軽微事件）は procedure を "SUMMARY" としてください。
 
@@ -238,10 +272,10 @@ def get_prosecutor_closing_prompt(case: CaseRecord, logs: str, evidence: str) ->
 {_format_case_context(case)}
 
 【審理記録】
-{logs}
+{_sanitize_user_text(logs)}
 
 【証拠一覧】
-{evidence if evidence else "提出された証拠なし"}
+{_sanitize_user_text(evidence) if evidence else "提出された証拠なし"}
 
 【論告求刑の指示】
 1. 事実関係を整理する
@@ -265,7 +299,7 @@ def get_defense_prompt(case: CaseRecord, phase_context: str = "") -> str:
 【弁護戦略】
 - 犯罪構成要件の不充足を主張する（該当する場合）
 - 違法収集証拠の排除を求める（該当する場合）
-- 正当防衛・緊急避難等の違法性阻却事由を検討する
+- 正当防衛・緊急避難等の違法性阻却事由を検討する（※立証責任は弁護側にある）
 - 責任能力の欠如・減少を検討する
 - 情状弁護（被告人の経歴、反省、被害弁償等）を行う
 - 量刑相場を踏まえた減刑を求める
@@ -313,10 +347,10 @@ def get_defense_closing_prompt(case: CaseRecord, logs: str, evidence: str) -> st
 {_format_case_context(case)}
 
 【審理記録】
-{logs}
+{_sanitize_user_text(logs)}
 
 【証拠一覧】
-{evidence if evidence else "提出された証拠なし"}
+{_sanitize_user_text(evidence) if evidence else "提出された証拠なし"}
 
 【最終弁論の指示】
 1. 審理を通じて明らかになった事実を整理する
@@ -402,7 +436,7 @@ def get_judge_summary_order_prompt(case: CaseRecord, logs: str) -> str:
 {_format_case_context(case)}
 
 【審理記録】
-{logs}
+{_sanitize_user_text(logs)}
 
 【略式命令の基準】
 - 公判を開かず、書面審理のみで判断する
@@ -416,11 +450,11 @@ def get_judge_summary_order_prompt(case: CaseRecord, logs: str) -> str:
 3. 罰金額を決定する（日本の法定刑の範囲内）
 4. 略式命令主文を述べる
 
-必ず以下のJSON形式を含めてください：
+必ず以下のJSON形式を含めてください（全フィールド必須）：
 ```json
 {{
     "verdict": "SUMMARY_FINE",
-    "sentence": "罰金○万円",
+    "sentence": "罰金○万円（100万円以下の金額を記載）",
     "summary": "略式命令要旨（100文字以内）"
 }}
 ```"""
@@ -434,7 +468,7 @@ def get_judge_jokoku_review_prompt(case: CaseRecord, original_verdict: str, joko
     if case.case_type == CaseType.CRIMINAL:
         legal_basis = "刑事訴訟法405条"
         grounds = """- 憲法違反（憲法の解釈に誤りがある、憲法に違反する）
-- 判例違反（最高裁判例と相反する判断をした）
+- 判例違反（最高裁判例と直接相反する判断をした。単に異なる事案への適用ではなく、同種事案で異なる法的結論を導いた場合に限る）
 - 法令違反（法令の解釈に関する重要な事項を含む）"""
     else:
         legal_basis = "民事訴訟法312条"
@@ -462,6 +496,14 @@ def get_judge_jokoku_review_prompt(case: CaseRecord, original_verdict: str, joko
 2. 該当する場合、どの条項に基づくか明示する
 3. 上告審の審理範囲（法律審であり事実審ではない）を踏まえて判断する
 4. 受理/不受理の決定を行う
+
+必ず以下のJSON形式を含めてください：
+```json
+{{
+    "decision": "ACCEPT" または "REJECT",
+    "reason": "審査結果の理由"
+}}
+```
 
 日本語で、最高裁判所裁判官として格式高い口調で応答してください。"""
 

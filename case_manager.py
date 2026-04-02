@@ -255,10 +255,10 @@ async def reject_settlement(case_id: int, user_id: str) -> str:
 
     await db.add_case_log(case_id, CivilPhase.SETTLEMENT_PROPOSED, user_id, "和解を拒否")
 
-    # Restore the phase from before settlement was proposed
+    # Restore the phase from before settlement was proposed (use latest SETTLEMENT_FROM)
     restore_phase = CivilPhase.ORAL_ARGUMENT  # default fallback
     logs = await db.get_case_logs(case_id)
-    for log in logs:
+    for log in reversed(logs):
         action = log.get("action_type") or ""
         if action.startswith("SETTLEMENT_FROM:"):
             restore_phase = action.split(":", 1)[1]
@@ -267,7 +267,7 @@ async def reject_settlement(case_id: int, user_id: str) -> str:
     await db.update_case_phase(case_id, restore_phase)
 
     role = "原告" if user_id == case.plaintiff_id else "被告"
-    phase_label = {"ORAL_ARGUMENT": "口頭弁論", "EVIDENCE_EXAMINATION": "証拠調べ", "ISSUE_ORGANIZATION": "争点整理"}.get(restore_phase, restore_phase)
+    phase_label = get_phase_display(restore_phase)
     return (
         f"⚖️ 【{case.case_number}】和解拒否\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -397,7 +397,7 @@ async def render_civil_verdict(case_id: int) -> str:
 
     logs = await db.get_case_logs(case_id)
     evidences = await db.get_evidence(case_id)
-    precedents = await db.search_precedents(case.complaint_text[:50])
+    precedents = await db.search_precedents(case.complaint_text[:100])
 
     try:
         verdict_text, verdict_data = await ai_engine.judge_render_verdict(
@@ -802,10 +802,9 @@ async def render_criminal_verdict(case_id: int) -> str:
     if case.phase in (CriminalPhase.VERDICT, CriminalPhase.CLOSED):
         return "❌ この事件は既に判決済みです。"
 
-    # Phase prerequisite: must have had final statement or waiver
+    # Phase prerequisite: must have had at least defense closing or final statement
     required_phases = (
         CriminalPhase.FINAL_STATEMENT, CriminalPhase.DEFENSE_CLOSING,
-        CriminalPhase.PROSECUTION_CLOSING,
     )
     if case.phase not in required_phases:
         return (
@@ -815,7 +814,7 @@ async def render_criminal_verdict(case_id: int) -> str:
 
     logs = await db.get_case_logs(case_id)
     evidences = await db.get_evidence(case_id)
-    precedents = await db.search_precedents(case.complaint_text[:50])
+    precedents = await db.search_precedents(case.complaint_text[:100])
 
     try:
         verdict_text, verdict_data = await ai_engine.judge_render_verdict(
@@ -889,7 +888,7 @@ async def file_appeal(case_id: int, appellant_id: str) -> str:
     if deadline and deadline.tzinfo is None:
         deadline = deadline.replace(tzinfo=timezone.utc)
     if deadline and now_utc > deadline:
-        return "❌ 控訴期限（14日）を過ぎています。"
+        return f"❌ 控訴期限（{APPEAL_DEADLINE_DAYS}日）を過ぎています。"
 
     # Determine next court level
     if case.court_level == CourtLevel.DISTRICT:
@@ -999,6 +998,10 @@ async def get_case_detail(case_id: int) -> str:
     if not case:
         return "❌ 事件が見つかりません。"
 
+    # Auto-close expired summary orders
+    if await _auto_close_expired_summary(case):
+        case = await db.get_case(case_id)
+
     case_type = "民事" if case.case_type == CaseType.CIVIL else "刑事"
     court = {"SUMMARY": "簡易裁判所", "DISTRICT": "地方裁判所", "HIGH": "高等裁判所", "SUPREME": "最高裁判所"}.get(case.court_level, case.court_level)
 
@@ -1008,7 +1011,7 @@ async def get_case_detail(case_id: int) -> str:
         f"種別: {case_type} | 審級: {court}\n"
         f"フェーズ: {get_phase_display(case.phase)}\n"
         f"状態: {case.status}\n"
-        f"提訴日: {case.created_at}\n"
+        f"提訴日: {case.created_at.astimezone(JST).strftime('%Y年%m月%d日 %H:%M') if case.created_at else '不明'}\n"
     )
 
     if case.verdict_text:
@@ -1016,7 +1019,7 @@ async def get_case_detail(case_id: int) -> str:
         if case.sentence:
             detail += f"\n量刑: {case.sentence}"
         if case.appeal_deadline:
-            detail += f"\n控訴期限: {case.appeal_deadline}"
+            detail += f"\n控訴期限: {_format_appeal_deadline(case.appeal_deadline)}"
 
     return detail
 
@@ -1197,7 +1200,7 @@ async def request_formal_trial(case_id: int, appellant_id: str) -> str:
     if deadline and deadline.tzinfo is None:
         deadline = deadline.replace(tzinfo=timezone.utc)
     if deadline and now_utc > deadline:
-        return "❌ 正式裁判請求期限（14日）を過ぎています。"
+        return f"❌ 正式裁判請求期限（{APPEAL_DEADLINE_DAYS}日）を過ぎています。"
 
     # Mark summary case as objected
     await db.update_case_phase(case_id, CriminalPhase.SUMMARY_OBJECTION)
@@ -1276,15 +1279,12 @@ async def file_jokoku_appeal(case_id: int, appellant_id: str, reason: str) -> st
     if deadline and deadline.tzinfo is None:
         deadline = deadline.replace(tzinfo=timezone.utc)
     if deadline and now_utc > deadline:
-        return "❌ 上告期限（14日）を過ぎています。"
+        return f"❌ 上告期限（{APPEAL_DEADLINE_DAYS}日）を過ぎています。"
 
     if not reason.strip():
         return "❌ 上告理由を記載してください。\n使い方: /上告 上告理由（憲法違反・判例違反等）"
 
-    # Mark original case as appealed
-    await db.update_case_status(case_id, CaseStatus.JOKOKU_APPEALED)
     closed_phase = CivilPhase.CLOSED if case.case_type == CaseType.CIVIL else CriminalPhase.CLOSED
-    await db.update_case_phase(case_id, closed_phase)
 
     # Create new case in Supreme Court
     if case.case_type == CaseType.CIVIL:
@@ -1298,8 +1298,7 @@ async def file_jokoku_appeal(case_id: int, appellant_id: str, reason: str) -> st
         f"上告理由: {reason}"
     )
 
-    # AI reviews the jokoku appeal BEFORE creating new case
-    # Use a temporary CaseRecord for the review prompt
+    # AI reviews the jokoku appeal BEFORE changing status or creating new case
     temp_case = CaseRecord(
         case_number="(上告審査中)",
         case_type=case.case_type,
@@ -1312,23 +1311,17 @@ async def file_jokoku_appeal(case_id: int, appellant_id: str, reason: str) -> st
     )
 
     try:
-        review = await ai_engine.judge_review_jokoku(
+        review, is_accepted = await ai_engine.judge_review_jokoku(
             temp_case, case.verdict_text or "", reason
         )
     except AIResponseError:
         review = "（上告審受理審査の生成に失敗しました。手続きは進行可能です。）"
+        is_accepted = True  # Fail-open: allow appeal if AI fails
 
-    # Check if the review indicates rejection (parse for common rejection phrases)
-    rejection_keywords = ["不受理", "棄却", "却下", "上告理由に該当しない", "受理しない"]
-    is_rejected = any(kw in review for kw in rejection_keywords) and "受理" not in review.split("不受理")[0][-10:] if "不受理" in review else any(kw in review for kw in rejection_keywords)
-
-    if is_rejected:
+    if not is_accepted:
         # Do not create new case — log the rejection on the original case
         await db.add_case_log(case.id, "JOKOKU_REVIEW", "JUDGE", review,
                               action_type="JOKOKU_REJECTED")
-        # Restore original case status (undo the JOKOKU_APPEALED)
-        await db.update_case_status(case_id, CaseStatus.CLOSED)
-        await db.update_case_phase(case_id, closed_phase)
         return (
             f"⚖️ 【上告不受理】\n"
             f"対象事件: {case.case_number}\n"
@@ -1339,7 +1332,10 @@ async def file_jokoku_appeal(case_id: int, appellant_id: str, reason: str) -> st
             f"上告理由が法定の上告理由に該当しないため、上告は不受理となりました。"
         )
 
-    # Accepted — create new case in Supreme Court
+    # Accepted — mark original case as appealed, then create new case
+    await db.update_case_status(case_id, CaseStatus.JOKOKU_APPEALED)
+    await db.update_case_phase(case_id, closed_phase)
+
     new_case = await db.create_case(
         case_type=case.case_type,
         court_level=CourtLevel.SUPREME,
@@ -1392,6 +1388,15 @@ async def file_retrial(original_case_number: str, group_id: str, petitioner_id: 
         return "❌ あなたはこの事件の当事者ではありません。"
     if case.status not in (CaseStatus.CLOSED, CaseStatus.APPEALED, CaseStatus.JOKOKU_APPEALED):
         return "❌ 再審は確定判決（終結済みの事件）に対してのみ請求できます。"
+
+    # Check retrial deadline (365 days from case closure for this simulation)
+    if case.updated_at:
+        closed_at = case.updated_at
+        if closed_at.tzinfo is None:
+            closed_at = closed_at.replace(tzinfo=timezone.utc)
+        retrial_deadline = closed_at + timedelta(days=365)
+        if datetime.now(timezone.utc) > retrial_deadline:
+            return "❌ 再審請求の期限（判決確定から1年）を過ぎています。"
 
     # AI judge reviews the retrial request
     try:
@@ -1448,7 +1453,7 @@ async def file_retrial(original_case_number: str, group_id: str, petitioner_id: 
     original_logs = await db.get_case_logs(case.id)
     logs_summary = _format_logs(original_logs)
     await db.add_case_log(new_case.id, initial_phase, "SYSTEM",
-                          f"再審開始決定。原審事件番号: {case.case_number}\n\n【原審記録の要旨】\n{logs_summary[:2000]}")
+                          f"再審開始決定。原審事件番号: {case.case_number}\n\n【原審記録の要旨】\n{logs_summary[:3000]}")
 
     court_name = {
         "DISTRICT": "地方裁判所", "HIGH": "高等裁判所", "SUPREME": "最高裁判所"
@@ -1493,10 +1498,19 @@ async def file_kokoku(original_case_number: str, group_id: str, appellant_id: st
     if case.status != CaseStatus.SETTLED:
         return "❌ 抗告は和解決定（和解成立済の事件）に対してのみ可能です。"
 
-    # Check deadline (14 days from settlement)
+    # Check deadline from settlement timestamp (not updated_at which changes on any DB update)
     now_utc = datetime.now(timezone.utc)
-    if case.updated_at:
-        settled_at = case.updated_at
+    original_logs = await db.get_case_logs(case.id)
+    settled_at = None
+    for log in reversed(original_logs):
+        if log.get("action_type") == "SETTLEMENT_ACCEPT":
+            ts = log.get("created_at")
+            if isinstance(ts, datetime):
+                settled_at = ts
+                break
+    if settled_at is None:
+        settled_at = case.updated_at  # fallback
+    if settled_at:
         if settled_at.tzinfo is None:
             settled_at = settled_at.replace(tzinfo=timezone.utc)
         kokoku_deadline = settled_at + timedelta(days=KOKOKU_DEADLINE_DAYS)
@@ -1538,8 +1552,10 @@ async def file_kokoku(original_case_number: str, group_id: str, appellant_id: st
         next_level = CourtLevel.HIGH
     elif case.court_level == CourtLevel.HIGH:
         next_level = CourtLevel.SUPREME
+    elif case.court_level == CourtLevel.SUPREME:
+        return "❌ 最高裁判所の和解決定に対してはこれ以上の抗告はできません。"
     else:
-        next_level = CourtLevel.SUPREME
+        next_level = CourtLevel.HIGH
 
     initial_phase = CivilPhase.ORAL_ARGUMENT if case.case_type == CaseType.CIVIL else CriminalPhase.EVIDENCE_EXAMINATION
 

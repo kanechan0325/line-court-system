@@ -36,6 +36,7 @@ from ai_personas import (
     get_judge_jokoku_review_prompt,
     get_judge_retrial_review_prompt,
     get_judge_kokoku_review_prompt,
+    _sanitize_user_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,20 +45,22 @@ CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Shared httpx client for Claude API
 _claude_client: Optional[httpx.AsyncClient] = None
+_claude_client_lock = asyncio.Lock()
 
 
 async def _get_claude_client() -> httpx.AsyncClient:
     """Get or create the shared Claude API client."""
     global _claude_client
-    if _claude_client is None or _claude_client.is_closed:
-        _claude_client = httpx.AsyncClient(
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            timeout=120.0,
-        )
+    async with _claude_client_lock:
+        if _claude_client is None or _claude_client.is_closed:
+            _claude_client = httpx.AsyncClient(
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                timeout=120.0,
+            )
     return _claude_client
 
 
@@ -86,6 +89,8 @@ async def call_claude(system_prompt: str, user_message: str, max_tokens: int = 4
             resp = await client.post(CLAUDE_API_URL, json=payload)
             resp.raise_for_status()
             data = resp.json()
+            if not isinstance(data, dict) or "content" not in data:
+                raise AIResponseError("AI応答の形式が不正です。")
             content_blocks = data.get("content", [])
             text_parts = [b["text"] for b in content_blocks if b.get("type") == "text"]
             result = "\n".join(text_parts)
@@ -95,14 +100,14 @@ async def call_claude(system_prompt: str, user_message: str, max_tokens: int = 4
         except httpx.TimeoutException:
             logger.warning(f"Claude API timeout (attempt {attempt + 1}/3)")
             last_error = AIResponseError("AI応答がタイムアウトしました。しばらく待ってから再度お試しください。")
-            await asyncio.sleep(2 ** attempt)
+            await asyncio.sleep(min(2 ** attempt, 10))
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
             logger.error(f"Claude API HTTP error: {status} {e.response.text}")
-            if status == 429 or status >= 500:
+            if status in (408, 429) or status >= 500:
                 # Retryable errors
                 last_error = AIResponseError(f"AI APIエラーが発生しました（{status}）。")
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(min(2 ** attempt, 10))
                 continue
             raise AIResponseError(f"AI APIエラーが発生しました（{status}）。")
         except AIResponseError:
@@ -115,18 +120,34 @@ async def call_claude(system_prompt: str, user_message: str, max_tokens: int = 4
 
 
 def _extract_json_by_brace_counting(text: str, start: int) -> Optional[dict]:
-    """Extract a JSON object starting at the given position using brace counting."""
+    """Extract a JSON object starting at the given position using brace counting.
+
+    Handles braces inside JSON string literals (skips content between unescaped quotes).
+    """
     brace_count = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            brace_count += 1
-        elif text[i] == "}":
-            brace_count -= 1
-            if brace_count == 0:
-                try:
-                    return json.loads(text[start:i + 1])
-                except json.JSONDecodeError:
-                    return None
+    in_string = False
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if in_string:
+            if ch == "\\" and i + 1 < len(text):
+                i += 2  # skip escaped character
+                continue
+            if ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                brace_count += 1
+            elif ch == "}":
+                brace_count -= 1
+                if brace_count == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        return None
+        i += 1
     return None
 
 
@@ -168,7 +189,7 @@ def parse_prosecution_json(text: str) -> Optional[dict]:
 async def judge_review_complaint(case: CaseRecord) -> str:
     """Judge reviews a complaint for acceptance."""
     system = get_judge_review_prompt(case)
-    user_msg = f"訴状/告訴状の内容:\n{case.complaint_text}\n\n受理審査を行ってください。"
+    user_msg = f"訴状/告訴状の内容:\n{_sanitize_user_text(case.complaint_text)}\n\n受理審査を行ってください。"
     return await call_claude(system, user_msg)
 
 
@@ -208,7 +229,7 @@ async def judge_respond(case: CaseRecord, user_input: str, context: str = "") ->
 async def prosecutor_investigate(case: CaseRecord) -> str:
     """Prosecutor conducts an investigation."""
     system = get_prosecutor_investigation_prompt(case)
-    user_msg = f"告訴内容:\n{case.complaint_text}\n\n捜査を開始してください。"
+    user_msg = f"告訴内容:\n{_sanitize_user_text(case.complaint_text)}\n\n捜査を開始してください。"
     return await call_claude(system, user_msg)
 
 
@@ -234,10 +255,16 @@ async def prosecutor_decide_charge(case: CaseRecord, investigation: str) -> tupl
     # Fallback: text-based detection — check for NOT_PROSECUTE keywords first
     logger.warning("Prosecution decision JSON not found, falling back to text detection")
     not_prosecute_keywords = ["不起訴", "起訴猶予", "起訴しない", "嫌疑不十分", "嫌疑なし"]
-    if any(kw in response for kw in not_prosecute_keywords):
+    # Count keyword occurrences for more accurate detection
+    not_prosecute_count = sum(response.count(kw) for kw in not_prosecute_keywords)
+    prosecute_indicators = ["起訴相当", "起訴すべき", "公訴を提起"]
+    prosecute_count = sum(response.count(kw) for kw in prosecute_indicators)
+    if not_prosecute_count > prosecute_count:
         is_prosecuted = False
+    elif prosecute_count > 0 or "起訴" in response:
+        is_prosecuted = True
     else:
-        is_prosecuted = "起訴" in response
+        is_prosecuted = False
     # Check for summary procedure in text fallback — require positive phrasing
     summary_positive = ["略式起訴", "略式命令を請求", "略式手続が相当", "略式手続相当", "略式手続を相当"]
     summary_negative = ["略式手続は不適切", "略式手続は相当でない", "略式に適さない"]
@@ -364,11 +391,14 @@ async def prosecutor_summary_request(case: CaseRecord, investigation: str) -> tu
 
 # --- Jokoku Appeal functions ---
 
-async def judge_review_jokoku(case: CaseRecord, original_verdict: str, jokoku_reason: str) -> str:
-    """Judge reviews a jokoku appeal (上告審受理審査)."""
+async def judge_review_jokoku(case: CaseRecord, original_verdict: str, jokoku_reason: str) -> tuple[str, bool]:
+    """Judge reviews a jokoku appeal (上告審受理審査). Returns (response, is_accepted)."""
     system = get_judge_jokoku_review_prompt(case, original_verdict, jokoku_reason)
-    user_msg = f"上告理由:\n{jokoku_reason}\n\n上告審受理審査を行ってください。"
-    return await call_claude(system, user_msg)
+    user_msg = f"上告理由:\n{_sanitize_user_text(jokoku_reason)}\n\n上告審受理審査を行ってください。"
+    response = await call_claude(system, user_msg)
+    data = parse_review_decision_json(response)
+    is_accepted = data is not None and data.get("decision") == "ACCEPT"
+    return response, is_accepted
 
 
 # --- Retrial functions ---
@@ -381,7 +411,7 @@ def parse_review_decision_json(text: str) -> Optional[dict]:
 async def judge_review_retrial(case: CaseRecord, retrial_reason: str) -> tuple[str, bool]:
     """Judge reviews a retrial request. Returns (response, is_accepted)."""
     system = get_judge_retrial_review_prompt(case, retrial_reason)
-    user_msg = f"再審請求理由:\n{retrial_reason}\n\n再審事由の審査を行ってください。"
+    user_msg = f"再審請求理由:\n{_sanitize_user_text(retrial_reason)}\n\n再審事由の審査を行ってください。"
     response = await call_claude(system, user_msg)
     data = parse_review_decision_json(response)
     is_accepted = data is not None and data.get("decision") == "ACCEPT"
@@ -393,7 +423,7 @@ async def judge_review_retrial(case: CaseRecord, retrial_reason: str) -> tuple[s
 async def judge_review_kokoku(case: CaseRecord, kokoku_reason: str, settlement_content: str = "") -> tuple[str, bool]:
     """Judge reviews a kokoku appeal. Returns (response, is_accepted)."""
     system = get_judge_kokoku_review_prompt(case, kokoku_reason, settlement_content)
-    user_msg = f"抗告理由:\n{kokoku_reason}\n\n抗告の審査を行ってください。"
+    user_msg = f"抗告理由:\n{_sanitize_user_text(kokoku_reason)}\n\n抗告の審査を行ってください。"
     response = await call_claude(system, user_msg)
     data = parse_review_decision_json(response)
     is_accepted = data is not None and data.get("decision") == "ACCEPT"

@@ -12,7 +12,7 @@ from line_client import resolve_mention
 logger = logging.getLogger(__name__)
 
 # Case number pattern: R8-(ワ)-001 etc.
-CASE_NUMBER_PATTERN = re.compile(r"R8-\([ワネオわうあい][再]?\)-\d{3}")
+CASE_NUMBER_PATTERN = re.compile(r"R8-\([ワネオわうあい][再]?\)-\d{3,}")
 
 
 def parse_command(text: str) -> tuple[str, str]:
@@ -159,8 +159,17 @@ async def handle_civil_complaint(
     mentionees = mention.get("mentionees", [])
     if mentionees:
         for m in mentionees:
+            # Use index/length from mention data for precise removal instead of string replace
+            idx = m.get("index")
+            length = m.get("length")
             display = m.get("text", "")
-            if display and display in complaint_text:
+            if idx is not None and length is not None:
+                # Remove mention text using position (adjusted for command prefix)
+                msg_text = event.get("message", {}).get("text", "")
+                mention_text = msg_text[idx:idx + length]
+                if mention_text in complaint_text:
+                    complaint_text = complaint_text.replace(mention_text, "", 1).strip()
+            elif display and display in complaint_text:
                 complaint_text = complaint_text.replace(display, "", 1).strip()
 
     if not complaint_text:
@@ -187,8 +196,15 @@ async def handle_criminal_complaint(
     mentionees = mention.get("mentionees", [])
     if mentionees:
         for m in mentionees:
+            idx = m.get("index")
+            length = m.get("length")
             display = m.get("text", "")
-            if display and display in complaint_text:
+            if idx is not None and length is not None:
+                msg_text = event.get("message", {}).get("text", "")
+                mention_text = msg_text[idx:idx + length]
+                if mention_text in complaint_text:
+                    complaint_text = complaint_text.replace(mention_text, "", 1).strip()
+            elif display and display in complaint_text:
                 complaint_text = complaint_text.replace(display, "", 1).strip()
 
     if not complaint_text:
@@ -269,6 +285,10 @@ async def handle_settlement_accept(group_id: str, user_id: str, args: str) -> st
     if err:
         return err
 
+    party_err = check_party(case, user_id)
+    if party_err:
+        return party_err
+
     return await case_manager.accept_settlement(case.id, user_id)
 
 
@@ -277,6 +297,10 @@ async def handle_settlement_reject(group_id: str, user_id: str, args: str) -> st
     case, _, err = await resolve_case(group_id, args)
     if err:
         return err
+
+    party_err = check_party(case, user_id)
+    if party_err:
+        return party_err
 
     return await case_manager.reject_settlement(case.id, user_id)
 
@@ -512,8 +536,8 @@ def handle_help() -> str:
         "📢 【不服申立】\n"
         "  /控訴 — 地裁判決に控訴（→高裁）\n"
         "  /上告 [事件番号] 理由 — 高裁判決に上告（→最高裁）\n"
-        "  /再審 [事件番号] 理由 — 確定判決の再審請求\n"
-        "  /抗告 [事件番号] 理由 — 和解決定への不服申立\n\n"
+        "  /再審 事件番号 理由 — 確定判決の再審請求（事件番号必須）\n"
+        "  /抗告 事件番号 理由 — 和解決定への不服申立（事件番号必須）\n\n"
         "📢 【情報】\n"
         "  /事件一覧 — 進行中の事件一覧\n"
         "  /事件詳細 [番号] — 事件の詳細\n"

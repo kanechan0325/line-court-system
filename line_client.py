@@ -1,3 +1,4 @@
+import asyncio
 import httpx
 import logging
 from typing import Optional
@@ -15,13 +16,15 @@ _headers = {
 
 # Shared httpx client for connection reuse
 _client: Optional[httpx.AsyncClient] = None
+_client_lock = asyncio.Lock()
 
 
 async def get_http_client() -> httpx.AsyncClient:
     """Get or create the shared HTTP client."""
     global _client
-    if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(headers=_headers, timeout=30.0)
+    async with _client_lock:
+        if _client is None or _client.is_closed:
+            _client = httpx.AsyncClient(headers=_headers, timeout=30.0)
     return _client
 
 
@@ -44,14 +47,18 @@ def split_message(text: str) -> list[str]:
             chunks.append(text)
             break
 
-        # Try to split at a newline
+        # Try to split at a newline (prefer any newline over splitting mid-text)
         split_pos = text.rfind("\n", 0, MAX_LINE_MESSAGE_LENGTH)
-        if split_pos == -1 or split_pos < MAX_LINE_MESSAGE_LENGTH // 2:
-            # Fall back to splitting at the limit
+        if split_pos == -1:
+            # No newline found — split at the limit
             split_pos = MAX_LINE_MESSAGE_LENGTH
 
         chunks.append(text[:split_pos])
-        text = text[split_pos:].lstrip("\n")
+        # Remove only the single newline at the split point, preserve subsequent formatting
+        remaining = text[split_pos:]
+        if remaining.startswith("\n"):
+            remaining = remaining[1:]
+        text = remaining
 
     return chunks
 
@@ -88,7 +95,6 @@ async def reply_message(reply_token: str, text: str) -> bool:
 
 async def push_message(to: str, text: str) -> bool:
     """Send a push message to a user or group. Returns True on success. Retries once on failure."""
-    import asyncio
     messages = _build_text_messages(text)
     client = await get_http_client()
     for attempt in range(2):
@@ -153,7 +159,7 @@ async def get_group_member_profile(group_id: str, user_id: str) -> Optional[str]
             logger.error(f"Group member profile API auth error: {resp.status_code}")
         return None
     except Exception as e:
-        logger.warning(f"Group member profile fetch error: {e}")
+        logger.warning(f"Group member profile fetch error for group={group_id} user={user_id}: {e}")
         return None
 
 

@@ -129,6 +129,7 @@ async def create_tables():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_case_logs_case_id ON case_logs(case_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_precedents_case_number ON precedents(case_number)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_subtype ON cases(case_subtype)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_created_at ON cases(created_at DESC)")
     logger.info("Database tables created/verified")
 
 
@@ -360,7 +361,7 @@ async def search_precedents(keyword: str) -> list[PrecedentRecord]:
         rows = await conn.fetch(
             """
             SELECT * FROM precedents
-            WHERE summary ILIKE $1 OR judgment_text ILIKE $1 OR case_number ILIKE $1
+            WHERE summary ILIKE $1 ESCAPE '\\' OR judgment_text ILIKE $1 ESCAPE '\\' OR case_number ILIKE $1 ESCAPE '\\'
             ORDER BY created_at DESC
             LIMIT 10
             """,
@@ -370,7 +371,7 @@ async def search_precedents(keyword: str) -> list[PrecedentRecord]:
 
 
 async def get_all_precedents() -> list[PrecedentRecord]:
-    """Get all precedents."""
+    """Get recent precedents (up to 20)."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -398,11 +399,11 @@ async def add_case_log(
 
 
 async def get_case_logs(case_id: int) -> list[dict]:
-    """Get all logs for a case."""
+    """Get logs for a case (up to 500 most recent)."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT * FROM case_logs WHERE case_id = $1 ORDER BY created_at",
+            "SELECT * FROM case_logs WHERE case_id = $1 ORDER BY created_at LIMIT 500",
             case_id,
         )
     return [dict(row) for row in rows]
@@ -414,7 +415,7 @@ def _row_to_case(row) -> CaseRecord:
     # case_subtype may not exist in older schemas before migration
     try:
         case_subtype = row["case_subtype"]
-    except (KeyError, Exception):
+    except KeyError:
         case_subtype = None
     return CaseRecord(
         id=row["id"],

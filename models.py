@@ -99,6 +99,7 @@ CRIMINAL_PHASE_ORDER = [
     CriminalPhase.COMPLAINT_FILED,
     CriminalPhase.INVESTIGATION,
     CriminalPhase.PROSECUTION_DECISION,
+    # NOT_PROSECUTED is a terminal branch from PROSECUTION_DECISION (not in linear order)
     CriminalPhase.RIGHTS_NOTIFICATION,
     CriminalPhase.ARRAIGNMENT,
     CriminalPhase.OPENING_PROCEDURE,
@@ -111,6 +112,14 @@ CRIMINAL_PHASE_ORDER = [
     CriminalPhase.VERDICT,
     CriminalPhase.CLOSED,
 ]
+
+# Terminal phases that branch off the main flow
+CRIMINAL_TERMINAL_PHASES = {
+    CriminalPhase.NOT_PROSECUTED,  # branches from PROSECUTION_DECISION
+    CriminalPhase.SUMMARY_CONSENT,  # branches into summary flow
+    CriminalPhase.SUMMARY_ORDER,
+    CriminalPhase.SUMMARY_OBJECTION,
+}
 
 # Summary trial phase order (略式手続フロー)
 CRIMINAL_SUMMARY_PHASE_ORDER = [
@@ -141,6 +150,8 @@ CASE_NUMBER_SYMBOLS = {
 
 def generate_case_number(case_type: CaseType, court_level: CourtLevel, seq: int, is_retrial: bool = False) -> str:
     """Generate a case number like R8-(ワ)-001"""
+    if seq < 1:
+        seq = 1
     type_symbols = CASE_NUMBER_SYMBOLS.get(case_type, {})
     symbol = type_symbols.get(court_level)
     if symbol is None:
@@ -185,7 +196,10 @@ PHASE_DISPLAY_NAMES = {
 
 def get_phase_display(phase: str) -> str:
     """Get Japanese display name for a phase."""
-    return PHASE_DISPLAY_NAMES.get(phase, phase)
+    name = PHASE_DISPLAY_NAMES.get(phase)
+    if name is None:
+        return phase  # Return as-is for unknown phases
+    return name
 
 
 @dataclass
@@ -208,6 +222,18 @@ class CaseRecord:
     parent_case_id: Optional[int] = None
     status: str = "ACTIVE"
     case_subtype: Optional[str] = None  # "SUMMARY", "JOKOKU", "RETRIAL", "KOKOKU"
+
+    def __post_init__(self):
+        """Validate enum fields if non-empty (empty allowed for default construction)."""
+        _valid_case_types = {e.value for e in CaseType}
+        _valid_court_levels = {e.value for e in CourtLevel}
+        _valid_statuses = {e.value for e in CaseStatus}
+        if self.case_type and self.case_type not in _valid_case_types:
+            raise ValueError(f"Invalid case_type: {self.case_type}")
+        if self.court_level and self.court_level not in _valid_court_levels:
+            raise ValueError(f"Invalid court_level: {self.court_level}")
+        if self.status and self.status not in _valid_statuses:
+            raise ValueError(f"Invalid status: {self.status}")
 
 
 @dataclass

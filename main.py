@@ -77,6 +77,9 @@ async def lifespan(app: FastAPI):
         pass
 
     # Cancel all group workers gracefully
+    pending_events = sum(q.qsize() for q in _group_queues.values())
+    if pending_events > 0:
+        logger.warning(f"Shutting down with {pending_events} pending events in queues")
     for gid, task in list(_group_workers.items()):
         task.cancel()
     for gid, task in list(_group_workers.items()):
@@ -97,6 +100,9 @@ app = FastAPI(title="LINE AI司法システム", lifespan=lifespan)
 _group_queues: dict[str, asyncio.Queue] = {}
 _group_workers: dict[str, asyncio.Task] = {}
 _group_last_active: dict[str, float] = {}
+
+# Lock for worker creation to prevent race conditions
+_worker_lock = asyncio.Lock()
 
 # Webhook deduplication (OrderedDict as LRU cache)
 _seen_events: OrderedDict[str, float] = OrderedDict()
@@ -167,22 +173,23 @@ async def _group_worker(group_id: str):
     logger.debug(f"Group worker for {group_id} cleaned up due to idle timeout")
 
 
-def _ensure_worker(group_id: str):
+async def _ensure_worker(group_id: str):
     """Ensure a worker exists for the group, restarting if crashed."""
-    existing = _group_workers.get(group_id)
-    if existing and not existing.done():
-        return
+    async with _worker_lock:
+        existing = _group_workers.get(group_id)
+        if existing and not existing.done():
+            return
 
-    if existing and existing.done():
-        logger.warning(f"Restarting crashed worker for group {group_id}")
+        if existing and existing.done():
+            logger.warning(f"Restarting crashed worker for group {group_id}")
 
-    if group_id not in _group_queues:
-        _group_queues[group_id] = asyncio.Queue()
+        if group_id not in _group_queues:
+            _group_queues[group_id] = asyncio.Queue()
 
-    _group_workers[group_id] = asyncio.create_task(_group_worker(group_id))
+        _group_workers[group_id] = asyncio.create_task(_group_worker(group_id))
 
 
-def enqueue_event(event: dict):
+async def enqueue_event(event: dict):
     """Enqueue an event for sequential processing per group."""
     if _is_duplicate_event(event):
         logger.info(f"Duplicate webhook event skipped: {event.get('webhookEventId')}")
@@ -194,7 +201,7 @@ def enqueue_event(event: dict):
     source = event.get("source", {})
     group_id = source.get("groupId", source.get("userId", "unknown"))
 
-    _ensure_worker(group_id)
+    await _ensure_worker(group_id)
     _group_queues[group_id].put_nowait(event)
 
 
@@ -215,8 +222,15 @@ def verify_signature(body: bytes, signature: str) -> bool:
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
-    return {"status": "ok", "service": "line-court-system"}
+    """Health check endpoint with DB connectivity verification."""
+    try:
+        pool = await db.get_pool()
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        return {"status": "ok", "service": "line-court-system"}
+    except Exception as e:
+        logger.warning(f"Health check DB error: {e}")
+        return {"status": "degraded", "service": "line-court-system", "db": "unavailable"}
 
 
 @app.post("/webhook")
@@ -238,7 +252,7 @@ async def callback(request: Request):
     events = data.get("events", [])
 
     for event in events:
-        enqueue_event(event)
+        await enqueue_event(event)
 
     return {"status": "ok"}
 
