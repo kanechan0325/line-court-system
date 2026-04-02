@@ -1,7 +1,7 @@
 import asyncpg
 import logging
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from config import DATABASE_URL, APPEAL_DEADLINE_DAYS
 from models import CaseRecord, EvidenceRecord, PrecedentRecord, CaseType, CourtLevel, generate_case_number
@@ -128,6 +128,7 @@ async def create_tables():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_case_id ON evidence(case_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_case_logs_case_id ON case_logs(case_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_precedents_case_number ON precedents(case_number)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_subtype ON cases(case_subtype)")
     logger.info("Database tables created/verified")
 
 
@@ -249,7 +250,7 @@ async def update_case_verdict(
     case_id: int, verdict_text: str, sentence: Optional[str] = None
 ):
     """Update the verdict and sentence of a case."""
-    appeal_deadline = datetime.utcnow() + timedelta(days=APPEAL_DEADLINE_DAYS)
+    appeal_deadline = datetime.now(timezone.utc) + timedelta(days=APPEAL_DEADLINE_DAYS)
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -284,11 +285,13 @@ async def update_case_court_level(case_id: int, court_level: str):
 
 
 async def get_closed_cases(group_id: str) -> list[CaseRecord]:
-    """Get all closed/settled cases for a group (for retrial/kokoku candidates)."""
+    """Get all closed/settled/appealed cases for a group (for retrial/kokoku candidates)."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT * FROM cases WHERE group_id = $1 AND status IN ('CLOSED', 'SETTLED') ORDER BY created_at DESC",
+            "SELECT * FROM cases WHERE group_id = $1 AND status IN "
+            "('CLOSED', 'SETTLED', 'APPEALED', 'JOKOKU_APPEALED', 'KOKOKU_APPEALED') "
+            "ORDER BY created_at DESC",
             group_id,
         )
     return [_row_to_case(row) for row in rows]
@@ -350,6 +353,8 @@ async def save_precedent(
 
 async def search_precedents(keyword: str) -> list[PrecedentRecord]:
     """Search precedents by keyword in summary or judgment text."""
+    # Escape LIKE wildcard characters in user input
+    escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -359,7 +364,7 @@ async def search_precedents(keyword: str) -> list[PrecedentRecord]:
             ORDER BY created_at DESC
             LIMIT 10
             """,
-            f"%{keyword}%",
+            f"%{escaped}%",
         )
     return [_row_to_precedent(row) for row in rows]
 
@@ -406,6 +411,11 @@ async def get_case_logs(case_id: int) -> list[dict]:
 # --- Row mappers ---
 
 def _row_to_case(row) -> CaseRecord:
+    # case_subtype may not exist in older schemas before migration
+    try:
+        case_subtype = row["case_subtype"]
+    except (KeyError, Exception):
+        case_subtype = None
     return CaseRecord(
         id=row["id"],
         case_number=row["case_number"],
@@ -424,7 +434,7 @@ def _row_to_case(row) -> CaseRecord:
         appeal_deadline=row["appeal_deadline"],
         parent_case_id=row["parent_case_id"],
         status=row["status"],
-        case_subtype=row.get("case_subtype"),
+        case_subtype=case_subtype,
     )
 
 

@@ -61,6 +61,14 @@ class CaseStatus(str, Enum):
     KOKOKU_APPEALED = "KOKOKU_APPEALED"    # 抗告済
 
 
+class CaseSubtype(str, Enum):
+    SUMMARY = "SUMMARY"
+    JOKOKU = "JOKOKU"
+    RETRIAL = "RETRIAL"
+    KOKOKU = "KOKOKU"
+    FORMAL_FROM_SUMMARY = "FORMAL_FROM_SUMMARY"
+
+
 class Verdict(str, Enum):
     GUILTY = "GUILTY"
     NOT_GUILTY = "NOT_GUILTY"
@@ -104,6 +112,17 @@ CRIMINAL_PHASE_ORDER = [
     CriminalPhase.CLOSED,
 ]
 
+# Summary trial phase order (略式手続フロー)
+CRIMINAL_SUMMARY_PHASE_ORDER = [
+    CriminalPhase.COMPLAINT_FILED,
+    CriminalPhase.INVESTIGATION,
+    CriminalPhase.PROSECUTION_DECISION,
+    CriminalPhase.SUMMARY_CONSENT,
+    CriminalPhase.SUMMARY_ORDER,
+    CriminalPhase.SUMMARY_OBJECTION,  # only if formal trial requested
+    CriminalPhase.CLOSED,
+]
+
 # Case number symbols per court level and type
 CASE_NUMBER_SYMBOLS = {
     CaseType.CIVIL: {
@@ -122,7 +141,11 @@ CASE_NUMBER_SYMBOLS = {
 
 def generate_case_number(case_type: CaseType, court_level: CourtLevel, seq: int, is_retrial: bool = False) -> str:
     """Generate a case number like R8-(ワ)-001"""
-    symbol = CASE_NUMBER_SYMBOLS[case_type][court_level]
+    type_symbols = CASE_NUMBER_SYMBOLS.get(case_type, {})
+    symbol = type_symbols.get(court_level)
+    if symbol is None:
+        # Fallback: use DISTRICT symbol if court level not defined for this case type
+        symbol = type_symbols.get(CourtLevel.DISTRICT, "?")
     if is_retrial:
         symbol += "再"
     return f"R8-({symbol})-{seq:03d}"

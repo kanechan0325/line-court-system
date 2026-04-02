@@ -6,7 +6,7 @@ from typing import Optional
 
 JST = timezone(timedelta(hours=9))
 
-from config import APPEAL_DEADLINE_DAYS
+from config import APPEAL_DEADLINE_DAYS, KOKOKU_DEADLINE_DAYS
 from models import (
     CaseType, CourtLevel, CaseStatus, CivilPhase, CriminalPhase,
     CaseRecord, Verdict, get_phase_display,
@@ -436,13 +436,21 @@ async def render_civil_verdict(case_id: int) -> str:
     case = await db.get_case(case_id)
     deadline_str = _format_appeal_deadline(case.appeal_deadline if case else None)
 
+    # Guide user to the correct appeal command based on court level
+    if case.court_level == CourtLevel.HIGH:
+        appeal_guide = "/上告 [理由] で上告できます。"
+    elif case.court_level == CourtLevel.SUPREME:
+        appeal_guide = "最高裁判所の判決は最終判決です。"
+    else:
+        appeal_guide = "/控訴 で控訴できます。"
+
     return (
         f"⚖️ 【{case.case_number}】判決\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
         f"{verdict_text}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"控訴期限: {deadline_str}\n"
-        f"/控訴 で控訴できます。"
+        f"{appeal_guide}"
     )
 
 
@@ -620,7 +628,26 @@ async def proceed_criminal_phase(case_id: int) -> str:
 
     current_phase = case.phase
 
-    if current_phase == CriminalPhase.OPENING_PROCEDURE:
+    if current_phase == CriminalPhase.PROSECUTION_DECISION:
+        # Transition from prosecution decision to formal trial (skip summary)
+        case.phase = CriminalPhase.RIGHTS_NOTIFICATION
+        try:
+            rights = await ai_engine.defense_rights_notification(case)
+        except AIResponseError:
+            rights = "（権利告知の生成に失敗しました。被告人には黙秘権等の権利があります。）"
+
+        await db.update_case_phase(case_id, CriminalPhase.RIGHTS_NOTIFICATION)
+        await db.add_case_log(case_id, CriminalPhase.RIGHTS_NOTIFICATION, "DEFENSE", rights)
+
+        return (
+            f"⚖️ 【{case.case_number}】通常起訴・権利告知\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"🛡️ 【弁護人による権利告知】\n{rights}\n\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"被告人は /罪状認否 認める または /罪状認否 否認 で応答してください。"
+        )
+
+    elif current_phase == CriminalPhase.OPENING_PROCEDURE:
         # → Opening statements — call AI first, then update phase
         case.phase = CriminalPhase.OPENING_STATEMENT
 
@@ -822,13 +849,21 @@ async def render_criminal_verdict(case_id: int) -> str:
     case = await db.get_case(case_id)
     deadline_str = _format_appeal_deadline(case.appeal_deadline if case else None)
 
+    # Guide user to the correct appeal command based on court level
+    if case.court_level == CourtLevel.HIGH:
+        appeal_guide = "/上告 [理由] で上告できます。"
+    elif case.court_level == CourtLevel.SUPREME:
+        appeal_guide = "最高裁判所の判決は最終判決です。"
+    else:
+        appeal_guide = "/控訴 で控訴できます。"
+
     return (
         f"⚖️ 【{case.case_number}】判決\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
         f"{verdict_text}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"控訴期限: {deadline_str}\n"
-        f"/控訴 で控訴できます。"
+        f"{appeal_guide}"
     )
 
 
@@ -921,8 +956,30 @@ async def file_appeal(case_id: int, appellant_id: str) -> str:
     )
 
 
+async def _auto_close_expired_summary(case: CaseRecord) -> bool:
+    """Auto-close summary order cases whose formal trial deadline has expired. Returns True if closed."""
+    if case.phase != CriminalPhase.SUMMARY_ORDER or case.status != CaseStatus.ACTIVE:
+        return False
+    now_utc = datetime.now(timezone.utc)
+    deadline = case.appeal_deadline
+    if deadline and deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    if deadline and now_utc > deadline:
+        await db.update_case_phase(case.id, CriminalPhase.CLOSED)
+        await db.update_case_status(case.id, CaseStatus.CLOSED)
+        await db.add_case_log(case.id, CriminalPhase.CLOSED, "SYSTEM",
+                              "正式裁判請求期限が経過したため、略式命令が確定しました。")
+        return True
+    return False
+
+
 async def get_case_list(group_id: str) -> str:
     """Get a list of cases for a group."""
+    cases = await db.get_active_cases(group_id)
+    # Auto-close expired summary orders
+    for c in cases:
+        await _auto_close_expired_summary(c)
+    # Re-fetch after possible auto-close
     cases = await db.get_active_cases(group_id)
     if not cases:
         return "📋 現在進行中の事件はありません。"
@@ -943,7 +1000,7 @@ async def get_case_detail(case_id: int) -> str:
         return "❌ 事件が見つかりません。"
 
     case_type = "民事" if case.case_type == CaseType.CIVIL else "刑事"
-    court = {"SUMMARY": "簡裁", "DISTRICT": "地裁", "HIGH": "高裁", "SUPREME": "最高裁"}.get(case.court_level, case.court_level)
+    court = {"SUMMARY": "簡易裁判所", "DISTRICT": "地方裁判所", "HIGH": "高等裁判所", "SUPREME": "最高裁判所"}.get(case.court_level, case.court_level)
 
     detail = (
         f"⚖️ 【事件詳細】{case.case_number}\n"
@@ -1008,6 +1065,17 @@ async def request_summary_prosecution(case_id: int) -> str:
 
     await db.add_case_log(case_id, CriminalPhase.PROSECUTION_DECISION, "PROSECUTOR", response,
                           action_type="SUMMARY_REQUEST")
+
+    # Check if AI determined the case is NOT eligible for summary
+    if data and data.get("summary_eligible") is False:
+        return (
+            f"⚖️ 【{case.case_number}】略式手続不適格\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"📋 【検察官の検討結果】\n{response}\n\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"本件は略式手続の要件を満たしません。\n"
+            f"/次へ で通常の起訴手続きに進めてください。"
+        )
 
     # Transition to SUMMARY_CONSENT — awaiting defendant consent
     await db.update_case_phase(case_id, CriminalPhase.SUMMARY_CONSENT)
@@ -1137,7 +1205,7 @@ async def request_formal_trial(case_id: int, appellant_id: str) -> str:
     await db.add_case_log(case_id, CriminalPhase.SUMMARY_OBJECTION, appellant_id,
                           "正式裁判が請求された。", action_type="FORMAL_TRIAL_REQUEST")
 
-    # Create new case at DISTRICT level starting from ARRAIGNMENT
+    # Create new case at DISTRICT level starting from RIGHTS_NOTIFICATION
     formal_text = (
         f"【正式裁判】略式命令に対する正式裁判請求\n"
         f"原事件番号: {case.case_number}\n"
@@ -1148,7 +1216,7 @@ async def request_formal_trial(case_id: int, appellant_id: str) -> str:
     new_case = await db.create_case(
         case_type=case.case_type,
         court_level=CourtLevel.DISTRICT,
-        phase=CriminalPhase.ARRAIGNMENT,
+        phase=CriminalPhase.RIGHTS_NOTIFICATION,
         plaintiff_id=case.plaintiff_id,
         defendant_id=case.defendant_id,
         group_id=case.group_id,
@@ -1157,8 +1225,17 @@ async def request_formal_trial(case_id: int, appellant_id: str) -> str:
         case_subtype="FORMAL_FROM_SUMMARY",
     )
 
-    await db.add_case_log(new_case.id, CriminalPhase.ARRAIGNMENT, "SYSTEM",
+    await db.add_case_log(new_case.id, CriminalPhase.RIGHTS_NOTIFICATION, "SYSTEM",
                           f"略式命令（{case.case_number}）に対する正式裁判請求により新規開廷。")
+
+    # Generate rights notification
+    new_case.phase = CriminalPhase.RIGHTS_NOTIFICATION
+    try:
+        rights = await ai_engine.defense_rights_notification(new_case)
+    except AIResponseError:
+        rights = "（権利告知の生成に失敗しました。被告人には黙秘権等の権利があります。）"
+
+    await db.add_case_log(new_case.id, CriminalPhase.RIGHTS_NOTIFICATION, "DEFENSE", rights)
 
     return (
         f"⚖️ 【正式裁判請求受理】\n"
@@ -1167,7 +1244,9 @@ async def request_formal_trial(case_id: int, appellant_id: str) -> str:
         f"原略式事件: {case.case_number}\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
         f"略式命令に対する正式裁判請求が受理されました。\n"
-        f"罪状認否から通常の刑事裁判手続きを開始します。\n\n"
+        f"通常の刑事裁判手続きを開始します。\n\n"
+        f"🛡️ 【弁護人による権利告知】\n{rights}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
         f"被告人は /罪状認否 認める または /罪状認否 否認 で応答してください。"
     )
 
@@ -1219,6 +1298,48 @@ async def file_jokoku_appeal(case_id: int, appellant_id: str, reason: str) -> st
         f"上告理由: {reason}"
     )
 
+    # AI reviews the jokoku appeal BEFORE creating new case
+    # Use a temporary CaseRecord for the review prompt
+    temp_case = CaseRecord(
+        case_number="(上告審査中)",
+        case_type=case.case_type,
+        court_level=CourtLevel.SUPREME,
+        phase=initial_phase,
+        plaintiff_id=case.plaintiff_id,
+        defendant_id=case.defendant_id,
+        group_id=case.group_id,
+        complaint_text=jokoku_text,
+    )
+
+    try:
+        review = await ai_engine.judge_review_jokoku(
+            temp_case, case.verdict_text or "", reason
+        )
+    except AIResponseError:
+        review = "（上告審受理審査の生成に失敗しました。手続きは進行可能です。）"
+
+    # Check if the review indicates rejection (parse for common rejection phrases)
+    rejection_keywords = ["不受理", "棄却", "却下", "上告理由に該当しない", "受理しない"]
+    is_rejected = any(kw in review for kw in rejection_keywords) and "受理" not in review.split("不受理")[0][-10:] if "不受理" in review else any(kw in review for kw in rejection_keywords)
+
+    if is_rejected:
+        # Do not create new case — log the rejection on the original case
+        await db.add_case_log(case.id, "JOKOKU_REVIEW", "JUDGE", review,
+                              action_type="JOKOKU_REJECTED")
+        # Restore original case status (undo the JOKOKU_APPEALED)
+        await db.update_case_status(case_id, CaseStatus.CLOSED)
+        await db.update_case_phase(case_id, closed_phase)
+        return (
+            f"⚖️ 【上告不受理】\n"
+            f"対象事件: {case.case_number}\n"
+            f"上告理由: {reason}\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"📋 【上告審受理審査】\n{review}\n\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"上告理由が法定の上告理由に該当しないため、上告は不受理となりました。"
+        )
+
+    # Accepted — create new case in Supreme Court
     new_case = await db.create_case(
         case_type=case.case_type,
         court_level=CourtLevel.SUPREME,
@@ -1230,15 +1351,6 @@ async def file_jokoku_appeal(case_id: int, appellant_id: str, reason: str) -> st
         parent_case_id=case.id,
         case_subtype="JOKOKU",
     )
-
-    # AI reviews the jokoku appeal
-    new_case.phase = initial_phase
-    try:
-        review = await ai_engine.judge_review_jokoku(
-            new_case, case.verdict_text or "", reason
-        )
-    except AIResponseError:
-        review = "（上告審受理審査の生成に失敗しました。手続きは進行可能です。）"
 
     await db.add_case_log(new_case.id, initial_phase, "JUDGE", review)
 
@@ -1332,8 +1444,11 @@ async def file_retrial(original_case_number: str, group_id: str, petitioner_id: 
         is_retrial=True,
     )
 
+    # Copy original case logs to retrial for AI context
+    original_logs = await db.get_case_logs(case.id)
+    logs_summary = _format_logs(original_logs)
     await db.add_case_log(new_case.id, initial_phase, "SYSTEM",
-                          f"再審開始決定。原審事件番号: {case.case_number}")
+                          f"再審開始決定。原審事件番号: {case.case_number}\n\n【原審記録の要旨】\n{logs_summary[:2000]}")
 
     court_name = {
         "DISTRICT": "地方裁判所", "HIGH": "高等裁判所", "SUPREME": "最高裁判所"
@@ -1384,13 +1499,21 @@ async def file_kokoku(original_case_number: str, group_id: str, appellant_id: st
         settled_at = case.updated_at
         if settled_at.tzinfo is None:
             settled_at = settled_at.replace(tzinfo=timezone.utc)
-        kokoku_deadline = settled_at + timedelta(days=APPEAL_DEADLINE_DAYS)
+        kokoku_deadline = settled_at + timedelta(days=KOKOKU_DEADLINE_DAYS)
         if now_utc > kokoku_deadline:
-            return "❌ 即時抗告の期限（14日）を過ぎています。"
+            return f"❌ 即時抗告の期限（{KOKOKU_DEADLINE_DAYS}日）を過ぎています。"
+
+    # Get settlement content from logs for context
+    settlement_content = ""
+    original_logs = await db.get_case_logs(case.id)
+    for log in original_logs:
+        if log.get("actor") == "JUDGE" and log.get("phase") == "SETTLEMENT_PROPOSED":
+            settlement_content = log["content"]
+            break
 
     # AI judge reviews the kokoku appeal
     try:
-        review_text, is_accepted = await ai_engine.judge_review_kokoku(case, reason)
+        review_text, is_accepted = await ai_engine.judge_review_kokoku(case, reason, settlement_content)
     except AIResponseError as e:
         return f"❌ 抗告理由の審査中にエラーが発生しました: {e}"
 
@@ -1441,6 +1564,14 @@ async def file_kokoku(original_case_number: str, group_id: str, appellant_id: st
     await db.add_case_log(new_case.id, initial_phase, "SYSTEM",
                           f"抗告認容。原審事件番号: {case.case_number}")
 
+    # AI reviews the new case for consistency with appeal/jokoku pattern
+    new_case.phase = initial_phase
+    try:
+        appeal_review = await ai_engine.judge_review_complaint(new_case)
+    except AIResponseError:
+        appeal_review = "（抗告審受理審査の生成に失敗しました。手続きは進行可能です。）"
+    await db.add_case_log(new_case.id, initial_phase, "JUDGE", appeal_review)
+
     court_name = {
         "DISTRICT": "地方裁判所", "HIGH": "高等裁判所", "SUPREME": "最高裁判所"
     }.get(next_level, next_level)
@@ -1453,6 +1584,7 @@ async def file_kokoku(original_case_number: str, group_id: str, appellant_id: st
         f"抗告理由: {reason}\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
         f"📋 【抗告審査結果】\n{review_text}\n\n"
+        f"📋 【抗告審受理審査】\n{appeal_review}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"和解決定が取り消され、上級審にて審理を再開します。\n"
         f"/弁論 で主張を追加してください。"

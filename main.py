@@ -34,7 +34,8 @@ logger = logging.getLogger(__name__)
 async def self_ping():
     """Ping own health endpoint periodically to prevent Render free tier sleep."""
     if not RENDER_EXTERNAL_URL:
-        logger.info("RENDER_EXTERNAL_URL not set, skipping self-ping")
+        logger.warning("RENDER_EXTERNAL_URL not set — self-ping disabled. "
+                       "Set this env var on Render to prevent free tier sleep.")
         return
 
     url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/health"
@@ -312,8 +313,8 @@ async def process_event(event: dict):
                     event, reply_token, to,
                     "❌ システムエラーが発生しました。しばらく待ってから再度お試しください。"
                 )
-        except Exception:
-            pass
+        except Exception as e2:
+            logger.error(f"Failed to send error message: {e2}")
 
 
 if __name__ == "__main__":

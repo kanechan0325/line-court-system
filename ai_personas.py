@@ -29,7 +29,14 @@ def _court_level_ja(level: str) -> str:
 
 def _judgment_criteria(court_level: str) -> str:
     """Return judgment criteria based on court level."""
-    if court_level == CourtLevel.SUPREME:
+    if court_level == CourtLevel.SUMMARY:
+        return """【簡易裁判所の判断基準（略式手続）】
+- 書面審理のみで判断する（公判を開かない）
+- 100万円以下の罰金又は科料のみを科すことができる
+- 被疑者の略式手続への同意を確認する
+- 犯罪事実を認定し、適用法令を特定する
+- 罰金額は犯情・情状を考慮して決定する"""
+    elif court_level == CourtLevel.SUPREME:
         return """【最高裁判所の判断基準】
 - 憲法違反の有無を審査する
 - 判例違反の有無を審査する
@@ -468,10 +475,10 @@ def get_judge_retrial_review_prompt(case: CaseRecord, retrial_reason: str) -> st
         grounds = """再審事由（刑訴法435条各号）：
 1号: 原判決の証拠となった証拠書類が偽造・変造であることが証明されたとき
 2号: 原判決の証拠となった証言が虚偽であることが証明されたとき
-3号: 有罪を宣告された者に対し無罪等を認めるべき明らかな証拠を新たに発見したとき
-4号: 裁判官が職務犯罪を行ったことが確定判決で証明されたとき
-5号: 確定判決で犯罪が証明されたとき（その証拠が原判決の基礎となった場合）
-6号: 無罪を認めるべき新証拠の発見"""
+3号: 有罪の言渡を受けた者に対して無罪等を言渡すべき証拠があらたに発見されたとき
+4号: 原判決に関与した裁判官が職務犯罪を行ったことが確定判決で証明されたとき
+5号: 有罪の言渡を受けた者に対し特赦があったとき
+6号: 無罪を認めるべき明らかな新証拠の発見"""
     else:
         legal_basis = "民事訴訟法338条"
         grounds = """再審事由（民訴法338条各号）：
@@ -514,14 +521,15 @@ def get_judge_retrial_review_prompt(case: CaseRecord, retrial_reason: str) -> st
 
 # --- Kokoku Appeal (抗告) Prompts ---
 
-def get_judge_kokoku_review_prompt(case: CaseRecord, kokoku_reason: str) -> str:
+def get_judge_kokoku_review_prompt(case: CaseRecord, kokoku_reason: str, settlement_content: str = "") -> str:
     """Generate prompt for kokoku appeal review (抗告審査)."""
+    settlement_display = settlement_content or case.verdict_text or case.complaint_text
     return f"""あなたはAI裁判官（上級審）です。以下の抗告について審査を行ってください。
 
 {_format_case_context(case)}
 
 【和解内容】
-{case.verdict_text or case.complaint_text}
+{settlement_display}
 
 【抗告理由】
 {kokoku_reason}

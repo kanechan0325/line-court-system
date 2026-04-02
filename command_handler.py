@@ -400,29 +400,37 @@ async def handle_precedent_search(args: str) -> str:
 
 
 async def handle_summary_prosecution(group_id: str, user_id: str, args: str) -> str:
-    """Handle /略式起訴"""
+    """Handle /略式起訴 — accuser (plaintiff) only"""
     case, _, error = await resolve_case(group_id, args)
     if error:
         return error
     party_error = check_party(case, user_id)
     if party_error:
         return party_error
+    if user_id == case.defendant_id:
+        return "❌ 略式起訴は告訴人（原告側）のみが請求できます。"
     return await case_manager.request_summary_prosecution(case.id)
 
 
 async def handle_summary_consent(group_id: str, user_id: str, args: str) -> str:
-    """Handle /略式同意"""
+    """Handle /略式同意 — defendant only"""
     case, _, error = await resolve_case(group_id, args)
     if error:
         return error
+    party_error = check_party(case, user_id)
+    if party_error:
+        return party_error
     return await case_manager.consent_summary(case.id, user_id)
 
 
 async def handle_summary_reject(group_id: str, user_id: str, args: str) -> str:
-    """Handle /略式拒否"""
+    """Handle /略式拒否 — defendant only"""
     case, _, error = await resolve_case(group_id, args)
     if error:
         return error
+    party_error = check_party(case, user_id)
+    if party_error:
+        return party_error
     return await case_manager.reject_summary(case.id, user_id)
 
 
@@ -503,7 +511,7 @@ def handle_help() -> str:
         "  /判決 — 判決を求める\n\n"
         "📢 【不服申立】\n"
         "  /控訴 — 地裁判決に控訴（→高裁）\n"
-        "  /上告 [理由] — 高裁判決に上告（→最高裁）\n"
+        "  /上告 [事件番号] 理由 — 高裁判決に上告（→最高裁）\n"
         "  /再審 [事件番号] 理由 — 確定判決の再審請求\n"
         "  /抗告 [事件番号] 理由 — 和解決定への不服申立\n\n"
         "📢 【情報】\n"

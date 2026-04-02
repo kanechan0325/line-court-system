@@ -1,5 +1,6 @@
 """Claude API integration for each trial phase."""
 
+import asyncio
 import json
 import re
 import logging
@@ -94,13 +95,13 @@ async def call_claude(system_prompt: str, user_message: str, max_tokens: int = 4
         except httpx.TimeoutException:
             logger.warning(f"Claude API timeout (attempt {attempt + 1}/3)")
             last_error = AIResponseError("AI応答がタイムアウトしました。しばらく待ってから再度お試しください。")
+            await asyncio.sleep(2 ** attempt)
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
             logger.error(f"Claude API HTTP error: {status} {e.response.text}")
             if status == 429 or status >= 500:
                 # Retryable errors
                 last_error = AIResponseError(f"AI APIエラーが発生しました（{status}）。")
-                import asyncio
                 await asyncio.sleep(2 ** attempt)
                 continue
             raise AIResponseError(f"AI APIエラーが発生しました（{status}）。")
@@ -237,8 +238,10 @@ async def prosecutor_decide_charge(case: CaseRecord, investigation: str) -> tupl
         is_prosecuted = False
     else:
         is_prosecuted = "起訴" in response
-    # Check for summary procedure in text fallback
-    if "略式" in response:
+    # Check for summary procedure in text fallback — require positive phrasing
+    summary_positive = ["略式起訴", "略式命令を請求", "略式手続が相当", "略式手続相当", "略式手続を相当"]
+    summary_negative = ["略式手続は不適切", "略式手続は相当でない", "略式に適さない"]
+    if any(kw in response for kw in summary_positive) and not any(kw in response for kw in summary_negative):
         procedure = "SUMMARY"
     return response, is_prosecuted, procedure
 
@@ -387,9 +390,9 @@ async def judge_review_retrial(case: CaseRecord, retrial_reason: str) -> tuple[s
 
 # --- Kokoku Appeal functions ---
 
-async def judge_review_kokoku(case: CaseRecord, kokoku_reason: str) -> tuple[str, bool]:
+async def judge_review_kokoku(case: CaseRecord, kokoku_reason: str, settlement_content: str = "") -> tuple[str, bool]:
     """Judge reviews a kokoku appeal. Returns (response, is_accepted)."""
-    system = get_judge_kokoku_review_prompt(case, kokoku_reason)
+    system = get_judge_kokoku_review_prompt(case, kokoku_reason, settlement_content)
     user_msg = f"抗告理由:\n{kokoku_reason}\n\n抗告の審査を行ってください。"
     response = await call_claude(system, user_msg)
     data = parse_review_decision_json(response)

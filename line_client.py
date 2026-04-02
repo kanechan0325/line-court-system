@@ -87,21 +87,30 @@ async def reply_message(reply_token: str, text: str) -> bool:
 
 
 async def push_message(to: str, text: str) -> bool:
-    """Send a push message to a user or group. Returns True on success."""
+    """Send a push message to a user or group. Returns True on success. Retries once on failure."""
+    import asyncio
     messages = _build_text_messages(text)
     client = await get_http_client()
-    try:
-        resp = await client.post(
-            f"{LINE_API_BASE}/message/push",
-            json={"to": to, "messages": messages},
-        )
-        if resp.status_code == 200:
-            return True
-        logger.warning(f"Push failed: {resp.status_code} {resp.text}")
-        return False
-    except Exception as e:
-        logger.error(f"Push error: {e}")
-        return False
+    for attempt in range(2):
+        try:
+            resp = await client.post(
+                f"{LINE_API_BASE}/message/push",
+                json={"to": to, "messages": messages},
+            )
+            if resp.status_code == 200:
+                return True
+            logger.warning(f"Push failed (attempt {attempt + 1}): {resp.status_code} {resp.text}")
+            if attempt == 0 and resp.status_code >= 500:
+                await asyncio.sleep(1)
+                continue
+            return False
+        except Exception as e:
+            logger.error(f"Push error (attempt {attempt + 1}): {e}")
+            if attempt == 0:
+                await asyncio.sleep(1)
+                continue
+            return False
+    return False
 
 
 async def send_response(reply_token: str, group_id: str, text: str):
@@ -122,8 +131,11 @@ async def get_profile(user_id: str) -> Optional[str]:
         )
         if resp.status_code == 200:
             return resp.json().get("displayName")
+        if resp.status_code in (401, 403):
+            logger.error(f"Profile API auth error: {resp.status_code}")
         return None
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Profile fetch error for {user_id}: {e}")
         return None
 
 
@@ -137,8 +149,11 @@ async def get_group_member_profile(group_id: str, user_id: str) -> Optional[str]
         )
         if resp.status_code == 200:
             return resp.json().get("displayName")
+        if resp.status_code in (401, 403):
+            logger.error(f"Group member profile API auth error: {resp.status_code}")
         return None
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Group member profile fetch error: {e}")
         return None
 
 
